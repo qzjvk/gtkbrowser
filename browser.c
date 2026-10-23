@@ -47,6 +47,7 @@ typedef struct {
     GtkWidget *forward_button;
     GtkWidget *reload_button;
     GtkWidget *progress;
+    GtkWidget *blocked_button;
     GtkWidget *blocked_label;
     AdbProxy *proxy;
     gboolean adblock_enabled;
@@ -75,6 +76,7 @@ static void relayout_tabs(Browser *b);
 static char *normalize_uri(const char *s);
 static void set_adblock_enabled(Browser *b, gboolean enabled);
 static gboolean update_blocked_label(gpointer data);
+static void on_blocked_clicked(GtkButton *btn, Browser *b);
 
 /* ---------- helpers ---------- */
 
@@ -586,9 +588,27 @@ static gboolean update_blocked_label(gpointer data)
         return G_SOURCE_CONTINUE;
     guint64 count = b->proxy ? adb_proxy_blocked_count(b->proxy) : 0;
     char buf[48];
-    g_snprintf(buf, sizeof(buf), "\xF0\x9F\x9B\xA1 %llu", (unsigned long long)count);
+    g_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)count);
     gtk_label_set_text(GTK_LABEL(b->blocked_label), buf);
     return G_SOURCE_CONTINUE;
+}
+
+/* Clicking the counter shows the running total. */
+static void on_blocked_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    guint64 count = b->proxy ? adb_proxy_blocked_count(b->proxy) : 0;
+    char buf[80];
+    g_snprintf(buf, sizeof(buf),
+               "%llu tracker requests blocked so far.\n\n"
+               "Toggle filtering in Settings.",
+               (unsigned long long)count);
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(b->window),
+                                               GTK_DIALOG_MODAL,
+                                               GTK_MESSAGE_INFO,
+                                               GTK_BUTTONS_OK, "%s", buf);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
 }
 
 static void on_settings_clicked(GtkButton *btn, Browser *b)
@@ -1002,14 +1022,26 @@ int main(int argc, char *argv[])
     gtk_widget_set_tooltip_text(new_tab_button, "New tab (Ctrl+T)");
     gtk_widget_set_tooltip_text(close_tab_button, "Close tab (Ctrl+W)");
 
-    b->blocked_label = gtk_label_new("\xF0\x9F\x9B\xA1 0");
-    gtk_widget_set_tooltip_text(b->blocked_label, "Trackers blocked");
+    b->blocked_button = gtk_button_new();
+    {
+        GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        GtkWidget *bimg = gtk_image_new_from_icon_name("security-high",
+                                                       GTK_ICON_SIZE_SMALL_TOOLBAR);
+        b->blocked_label = gtk_label_new("0");
+        gtk_box_pack_start(GTK_BOX(bb), bimg, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(bb), b->blocked_label, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(b->blocked_button), bb);
+    }
+    gtk_widget_set_tooltip_text(b->blocked_button,
+                                "Trackers blocked — click for details");
+    g_signal_connect(b->blocked_button, "clicked",
+                     G_CALLBACK(on_blocked_clicked), b);
 
     gtk_box_pack_start(GTK_BOX(toolbar), b->back_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->forward_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->reload_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->url_entry, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->blocked_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), b->blocked_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), close_tab_button, FALSE, FALSE, 0);
