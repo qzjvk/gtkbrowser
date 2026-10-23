@@ -18,6 +18,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netdb.h>
+#include <time.h>
+#include <stdarg.h>
 
 /* ---------- blocklist ---------- */
 
@@ -125,6 +127,33 @@ struct AdbProxy {
     int port;
     gint blocked; /* atomic: total requests refused so far */
 };
+
+/* Diagnostics: append one line per event to /tmp/gtkbrowser-audit.log so
+ * proxy traffic and the blocked counter can be inspected while the browser
+ * runs normally (no GUI needed to read it). Fresh file per process. */
+static void audit(const char *fmt, ...)
+{
+    static FILE *f = NULL;
+    static int open_failed = 0;
+    if (!f && !open_failed) {
+        f = fopen("/tmp/gtkbrowser-audit.log", "w");
+        if (!f) {
+            open_failed = 1;
+            return;
+        }
+        setvbuf(f, NULL, _IOLBF, 0);
+    }
+    if (!f)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    fprintf(f, "%02d:%02d:%02d ", t->tm_hour, t->tm_min, t->tm_sec);
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    va_end(ap);
+}
 
 static gboolean host_matches(const char *host, const char *entry)
 {
@@ -297,6 +326,7 @@ static void *proxy_thread(gpointer data)
     char method[16] = {0}, target[2000] = {0};
     if (sscanf(line, "%15s %2000s", method, target) != 2)
         goto out;
+    audit("REQ %s %s", method, target);
 
     char host[512] = {0};
     int port = 80; /* plain HTTP default */
@@ -326,6 +356,8 @@ static void *proxy_thread(gpointer data)
 
     if (host_blocked(p, host)) {
         g_atomic_int_inc(&p->blocked);
+        audit("BLOCK %s %s:%d count=%d", method, host, port,
+              g_atomic_int_get(&p->blocked));
         static const char r403[] =
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(cfd, r403, sizeof(r403) - 1);
@@ -359,6 +391,7 @@ static void *proxy_thread(gpointer data)
         freeaddrinfo(res);
     }
     if (ufd < 0) {
+        audit("FAIL upstream connect %s:%d", host, port);
         static const char r502[] =
             "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(cfd, r502, sizeof(r502) - 1);
@@ -435,6 +468,7 @@ gboolean adb_proxy_start(AdbProxy *p)
     p->port = g_inet_socket_address_get_port(G_INET_SOCKET_ADDRESS(effective));
     g_object_unref(effective);
     g_object_unref(addr);
+    audit("PROXY port=%d", p->port);
 
     g_signal_connect(p->service, "incoming",
                      G_CALLBACK(on_client_connected), p);
