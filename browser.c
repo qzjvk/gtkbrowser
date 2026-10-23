@@ -35,12 +35,9 @@
 #define APP_NAME "GtkBrowser"
 #define HOME_URL "https://duckduckgo.com"
 #define SEARCH_URL "https://duckduckgo.com/?q=%s"
+/* Cap on the visible tab title length (the tooltip keeps the full text).
+ * Bounding the natural label width keeps the tab strip predictable. */
 #define TAB_LABEL_MAX_CHARS 24
-/* Measured per-tab chrome (icon + close button + spacing + notebook tab
- * border) that is not part of the title label. */
-#define TAB_OVERHEAD 40
-/* Never shrink a tab label below this width. */
-#define TAB_LABEL_FLOOR 60
 
 typedef struct {
     GtkWidget *window;
@@ -68,8 +65,6 @@ typedef struct {
     WebKitWebView *view;
     GtkWidget *icon_image;
     GtkWidget *title_label;
-    int full_label_width;    /* natural width of the title text */
-    int applied_label_width; /* last size_request applied to the label */
 } Tab;
 
 /* forward declarations */
@@ -78,7 +73,6 @@ static void close_tab(Browser *b, GtkWidget *page);
 static void update_url_entry(Browser *b, Tab *tab);
 static void update_nav_buttons(Browser *b, Tab *tab);
 static void update_window_title(Browser *b, Tab *tab);
-static void relayout_tabs(Browser *b);
 static char *normalize_uri(const char *s);
 static void set_adblock_enabled(Browser *b, gboolean enabled);
 static gboolean update_blocked_label(gpointer data);
@@ -133,78 +127,19 @@ static void update_url_entry(Browser *b, Tab *tab)
     gtk_entry_set_text(GTK_ENTRY(b->url_entry), uri ? uri : "");
 }
 
-/* Measure the natural pixel width of the tab's title text (clamped to
- * TAB_LABEL_MAX_CHARS) and store it in tab->full_label_width. */
-static void measure_tab_label(Tab *tab)
+/* Cap the visible tab title at TAB_LABEL_MAX_CHARS (the tooltip keeps the
+ * full text). Bounding each label's natural width keeps the tab strip
+ * predictable; GTK ellipsizes further when tabs are squeezed. */
+static char *truncate_tab_title(const char *s)
 {
-    const char *text = gtk_label_get_text(GTK_LABEL(tab->title_label));
-    if (!text || !*text)
-        text = "New Tab";
-
-    int w, h;
-    PangoLayout *layout = gtk_widget_create_pango_layout(tab->title_label, text);
-    pango_layout_get_pixel_size(layout, &w, &h);
-    g_object_unref(layout);
-
-    char *max_str = g_strnfill(TAB_LABEL_MAX_CHARS, '0');
-    PangoLayout *max_layout = gtk_widget_create_pango_layout(tab->title_label, max_str);
-    int max_w, dummy;
-    pango_layout_get_pixel_size(max_layout, &max_w, &dummy);
-    g_object_unref(max_layout);
-    g_free(max_str);
-
-    if (w > max_w)
-        w = max_w;
-    tab->full_label_width = w;
-}
-
-/* Scale every tab's title label so all tabs fit within the window width.
- * When there is plenty of room each tab keeps its natural width; when the
- * window is narrow the labels shrink proportionally (down to TAB_LABEL_FLOOR)
- * instead of forcing the window to grow. Only touches a label when the
- * computed width actually changes (avoids a size-allocation feedback loop). */
-static void relayout_tabs(Browser *b)
-{
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-    int n = gtk_notebook_get_n_pages(nb);
-    if (n == 0)
-        return;
-
-    int win_w = gtk_widget_get_allocated_width(b->notebook);
-    if (win_w <= 0)
-        win_w = gtk_widget_get_allocated_width(b->window);
-    if (win_w <= 0)
-        return;
-
-    int available = win_w - n * TAB_OVERHEAD;
-    if (available < n * TAB_LABEL_FLOOR)
-        available = n * TAB_LABEL_FLOOR;
-
-    int sum_full = 0;
-    for (int i = 0; i < n; i++) {
-        Tab *tab = g_object_get_data(G_OBJECT(gtk_notebook_get_nth_page(nb, i)), "tab");
-        if (tab)
-            sum_full += tab->full_label_width;
-    }
-    if (sum_full <= 0)
-        return;
-
-    double scale = 1.0;
-    if (sum_full > available)
-        scale = (double)available / (double)sum_full;
-
-    for (int i = 0; i < n; i++) {
-        Tab *tab = g_object_get_data(G_OBJECT(gtk_notebook_get_nth_page(nb, i)), "tab");
-        if (!tab)
-            continue;
-        int w = (int)(tab->full_label_width * scale);
-        if (w < TAB_LABEL_FLOOR)
-            w = TAB_LABEL_FLOOR;
-        if (w != tab->applied_label_width) {
-            gtk_widget_set_size_request(tab->title_label, w, -1);
-            tab->applied_label_width = w;
-        }
-    }
+    gsize len = g_utf8_strlen(s, -1);
+    if (len <= TAB_LABEL_MAX_CHARS)
+        return g_strdup(s);
+    const char *cut = g_utf8_offset_to_pointer(s, TAB_LABEL_MAX_CHARS);
+    char *trunc = g_strndup(s, (gsize)(cut - s));
+    char *out = g_strconcat(trunc, "…", NULL);
+    g_free(trunc);
+    return out;
 }
 
 static void update_nav_buttons(Browser *b, Tab *tab)
@@ -267,8 +202,6 @@ static void close_tab(Browser *b, GtkWidget *page)
     gtk_notebook_remove_page(nb, gtk_notebook_page_num(nb, page));
     if (gtk_notebook_get_n_pages(nb) == 0)
         gtk_widget_destroy(b->window);
-    else
-        relayout_tabs(b);
 }
 
 static void on_tab_close_clicked(GtkWidget *page, gpointer unused)
@@ -304,10 +237,8 @@ static void on_notify_title(WebKitWebView *view, GParamSpec *ps, Tab *tab)
     const char *title = webkit_web_view_get_title(view);
     const char *uri = webkit_web_view_get_uri(view);
     const char *text = (title && *title) ? title : (uri ? uri : "New Tab");
-    gtk_label_set_text(GTK_LABEL(tab->title_label), text);
+    gtk_label_set_text(GTK_LABEL(tab->title_label), truncate_tab_title(text));
     gtk_widget_set_tooltip_text(tab->title_label, text);
-    measure_tab_label(tab);
-    relayout_tabs(tab->browser);
     if (current_tab(tab->browser) == tab)
         update_window_title(tab->browser, tab);
 }
@@ -426,7 +357,10 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     tab->icon_image = gtk_image_new_from_icon_name("web-browser", GTK_ICON_SIZE_MENU);
     tab->title_label = gtk_label_new("New Tab");
     gtk_label_set_ellipsize(GTK_LABEL(tab->title_label), PANGO_ELLIPSIZE_END);
-    measure_tab_label(tab);
+    /* Minimum width zero: with many tabs open the window must still be
+     * resizable to any size. GTK scales the tabs down and the label
+     * ellipsizes when the strip runs out of room. */
+    gtk_widget_set_size_request(tab->title_label, 0, -1);
     GtkWidget *close_btn = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_MENU);
     gtk_button_set_relief(GTK_BUTTON(close_btn), GTK_RELIEF_NONE);
     gtk_widget_set_tooltip_text(close_btn, "Close tab");
@@ -465,7 +399,6 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     update_url_entry(b, tab);
     update_nav_buttons(b, tab);
     update_window_title(b, tab);
-    relayout_tabs(b);
     return page;
 }
 
@@ -1354,12 +1287,6 @@ static gboolean on_control_connected(GSocketService *service, GSocketConnection 
 
 /* ---------- window / cleanup ---------- */
 
-static gboolean on_configure(GtkWidget *w, GdkEventConfigure *e, Browser *b)
-{
-    relayout_tabs(b);
-    return FALSE;
-}
-
 static void on_destroy(GtkWidget *w, Browser *b)
 {
     if (b->control_service) {
@@ -1497,7 +1424,6 @@ int main(int argc, char *argv[])
     gtk_window_set_default_size(GTK_WINDOW(b->window), 1100, 700);
     g_signal_connect(b->window, "destroy", G_CALLBACK(on_destroy), b);
     g_signal_connect(b->window, "key-press-event", G_CALLBACK(on_key_press), b);
-    g_signal_connect(b->window, "configure-event", G_CALLBACK(on_configure), b);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(b->window), vbox);
