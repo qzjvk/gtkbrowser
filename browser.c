@@ -46,6 +46,8 @@ static const SearchEngine SEARCH_ENGINES[] = {
     { "Google", "https://www.google.com/search?q=" },
     { "Startpage", "https://www.startpage.com/sp/search?query=" },
     { "Bing", "https://www.bing.com/search?q=" },
+    { "Brave", "https://search.brave.com/search?q=" },
+    { "Custom", NULL }, /* template lives in settings; see search_template() */
 };
 #define N_SEARCH_ENGINES ((int)G_N_ELEMENTS(SEARCH_ENGINES))
 
@@ -73,6 +75,7 @@ typedef struct {
     GtkWidget *bookmarks_button;
     GtkListStore *url_model; /* autocomplete suggestions */
     int search_engine;       /* index into SEARCH_ENGINES */
+    gchar *custom_search_base; /* "Custom" engine URL template */
     gboolean fullscreen;     /* F11 state */
 } Browser;
 
@@ -107,6 +110,7 @@ static void refresh_url_model(Browser *b);
 static void bookmark_toggle(Browser *b, const char *uri, const char *title);
 static void cycle_tab(Browser *b, int delta);
 static void on_engine_changed(GtkComboBox *combo, Browser *b);
+static void on_custom_search_changed(GtkEntry *entry, Browser *b);
 static void drop_source_file(Tab *tab, const char *uri);
 
 /* ---------- helpers ---------- */
@@ -222,6 +226,34 @@ static void load_uri(Browser *b, const char *uri)
         webkit_web_view_load_uri(tab->view, uri);
 }
 
+/* Resolve the active engine's URL template: the built-in prefix, or the
+ * user's saved custom template (DuckDuckGo if that one is empty). */
+static const char *search_template(Browser *b)
+{
+    const SearchEngine *se = &SEARCH_ENGINES[b->search_engine];
+    if (se->base)
+        return se->base;
+    if (b->custom_search_base && *b->custom_search_base)
+        return b->custom_search_base;
+    return SEARCH_ENGINES[0].base;
+}
+
+/* Build the search URL. The template may carry the query as a %s or
+ * {query} placeholder; otherwise it is a prefix the query appends to. */
+static char *build_search_url(const char *tmpl, const char *escaped_query)
+{
+    const char *ph = strstr(tmpl, "%s");
+    const char *alt = strstr(tmpl, "{query}");
+    if (alt && (!ph || alt < ph))
+        ph = alt;
+    if (ph) {
+        size_t skip = (ph[0] == '{') ? 7 : 2;
+        return g_strdup_printf("%.*s%s%s", (int)(ph - tmpl), tmpl,
+                               escaped_query, ph + skip);
+    }
+    return g_strdup_printf("%s%s", tmpl, escaped_query);
+}
+
 static void navigate_from_entry(Browser *b)
 {
     const char *text = gtk_entry_get_text(GTK_ENTRY(b->url_entry));
@@ -233,8 +265,7 @@ static void navigate_from_entry(Browser *b)
         g_free(uri);
     } else {
         char *q = g_uri_escape_string(text, NULL, TRUE);
-        char *url = g_strdup_printf("%s%s",
-                                    SEARCH_ENGINES[b->search_engine].base, q);
+        char *url = build_search_url(search_template(b), q);
         g_free(q);
         load_uri(b, url);
         g_free(url);
@@ -651,11 +682,25 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     gtk_box_pack_start(GTK_BOX(engine_row), engine_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), engine_row, FALSE, FALSE, 0);
 
+    GtkWidget *custom_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(custom_row, GTK_ALIGN_START);
+    GtkWidget *custom_label = gtk_label_new("Custom search URL:");
+    GtkWidget *custom_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(custom_entry),
+                                   "https://search.example.com/?q=%s");
+    gtk_entry_set_width_chars(GTK_ENTRY(custom_entry), 36);
+    if (b->custom_search_base)
+        gtk_entry_set_text(GTK_ENTRY(custom_entry), b->custom_search_base);
+    gtk_box_pack_start(GTK_BOX(custom_row), custom_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(custom_row), custom_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), custom_row, FALSE, FALSE, 0);
+
     kp_build_settings_section(b, content);
 
     g_signal_connect(adblock_check, "toggled", G_CALLBACK(on_adblock_toggled), b);
     g_signal_connect(devtools_check, "toggled", G_CALLBACK(on_devtools_toggled), b);
     g_signal_connect(engine_combo, "changed", G_CALLBACK(on_engine_changed), b);
+    g_signal_connect(custom_entry, "changed", G_CALLBACK(on_custom_search_changed), b);
 
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
@@ -713,6 +758,7 @@ static void load_settings(Browser *b)
         int se = g_key_file_get_integer(kf, "search", "engine", NULL);
         if (se >= 0 && se < N_SEARCH_ENGINES)
             b->search_engine = se;
+        b->custom_search_base = g_key_file_get_string(kf, "search", "custom", NULL);
     }
     g_key_file_unref(kf);
     g_free(path);
@@ -724,6 +770,8 @@ static void save_settings(Browser *b)
     if (b->kp_db_path)
         g_key_file_set_string(kf, "keepass", "db", b->kp_db_path);
     g_key_file_set_integer(kf, "search", "engine", b->search_engine);
+    if (b->custom_search_base)
+        g_key_file_set_string(kf, "search", "custom", b->custom_search_base);
     char *path = settings_path();
     char *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
@@ -1487,6 +1535,14 @@ static void on_engine_changed(GtkComboBox *combo, Browser *b)
     }
 }
 
+static void on_custom_search_changed(GtkEntry *entry, Browser *b)
+{
+    const char *t = gtk_entry_get_text(GTK_ENTRY(entry));
+    g_free(b->custom_search_base);
+    b->custom_search_base = (t && *t) ? g_strdup(t) : NULL;
+    save_settings(b);
+}
+
 /* ---------- page source / save (Ctrl+U / Ctrl+S) ----------
  * This WebKit build has no view-source handler and no print_to_pdf, so the
  * page's HTML is fetched with JavaScript. View source loads it from a temp
@@ -1872,6 +1928,7 @@ static void on_destroy(GtkWidget *w, Browser *b)
     }
     secure_free(&b->kp_password);
     g_free(b->kp_db_path);
+    g_free(b->custom_search_base);
     history_save(b);
     bookmarks_save(b);
     if (b->history) {
