@@ -13,8 +13,10 @@ dependencies = [
 executable('gtkbrowser',
   'browser.c',
   'adblock.c',
+  'keepass.c',
   dependencies: dependencies,
   c_args: ['-Wno-unused-parameter'],
+  link_args: ['-lutil'],
   install: true,
   install_dir: get_option('bindir'))
 

@@ -21,7 +21,9 @@
  */
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+#include <jsc/jsc.h>
 #include "adblock.h"
+#include "keepass.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -54,6 +56,9 @@ typedef struct {
     gboolean adblock_enabled;
     gboolean devtools_enabled;
     gchar *blocklist_file;
+    GtkWidget *kp_fill_button;
+    gchar *kp_db_path;   /* configured .kdbx path (persisted) */
+    gchar *kp_password;  /* session cache of the db password */
     GSocketService *control_service;
     gchar *control_socket_path;
 } Browser;
@@ -77,6 +82,9 @@ static void relayout_tabs(Browser *b);
 static char *normalize_uri(const char *s);
 static void set_adblock_enabled(Browser *b, gboolean enabled);
 static gboolean update_blocked_label(gpointer data);
+static void fill_login(Browser *b);
+static void choose_kp_database(GtkButton *btn, Browser *b);
+static void kp_build_settings_section(Browser *b, GtkWidget *content);
 static void on_blocked_clicked(GtkButton *btn, Browser *b);
 
 /* ---------- helpers ---------- */
@@ -640,12 +648,496 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
 
     gtk_box_pack_start(GTK_BOX(content), devtools_check, FALSE, FALSE, 0);
 
+    kp_build_settings_section(b, content);
+
     g_signal_connect(adblock_check, "toggled", G_CALLBACK(on_adblock_toggled), b);
     g_signal_connect(devtools_check, "toggled", G_CALLBACK(on_devtools_toggled), b);
 
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
+}
+
+/* ---------- KeePass integration ---------- */
+
+static void secure_free(gchar **p)
+{
+    if (*p) {
+        memset(*p, 0, strlen(*p));
+        g_free(*p);
+        *p = NULL;
+    }
+}
+
+/* Encode a C string as a JSON string literal (with quotes). */
+static char *json_escape(const char *s)
+{
+    GString *g = g_string_new("\"");
+    for (const char *p = s ? s : ""; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+        case '"': g_string_append(g, "\\\""); break;
+        case '\\': g_string_append(g, "\\\\"); break;
+        case '\n': g_string_append(g, "\\n"); break;
+        case '\r': g_string_append(g, "\\r"); break;
+        case '\t': g_string_append(g, "\\t"); break;
+        default:
+            if (c < 0x20)
+                g_string_append_printf(g, "\\u%04x", c);
+            else
+                g_string_append_c(g, (char)c);
+        }
+    }
+    g_string_append_c(g, '"');
+    return g_string_free(g, FALSE);
+}
+
+/* Settings persistence (only non-secret values; the password stays in
+ * memory for the session). */
+static char *settings_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "gtkbrowser",
+                            "settings.ini", NULL);
+}
+
+static void load_settings(Browser *b)
+{
+    GKeyFile *kf = g_key_file_new();
+    char *path = settings_path();
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
+        b->kp_db_path = g_key_file_get_string(kf, "keepass", "db", NULL);
+    g_key_file_unref(kf);
+    g_free(path);
+}
+
+static void save_settings(Browser *b)
+{
+    GKeyFile *kf = g_key_file_new();
+    if (b->kp_db_path)
+        g_key_file_set_string(kf, "keepass", "db", b->kp_db_path);
+    char *path = settings_path();
+    char *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+    g_key_file_save_to_file(kf, path, NULL);
+    g_key_file_unref(kf);
+    g_free(path);
+}
+
+static gchar *ask_kp_password(Browser *b)
+{
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("KeePass database",
+                                                    GTK_WINDOW(b->window),
+                                                    GTK_DIALOG_MODAL,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Unlock", GTK_RESPONSE_OK,
+                                                    NULL);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *info = gtk_label_new(NULL);
+    char *lbl = g_strdup_printf("Enter the password for:\n%s", b->kp_db_path);
+    gtk_label_set_text(GTK_LABEL(info), lbl);
+    g_free(lbl);
+    gtk_widget_set_halign(info, GTK_ALIGN_START);
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
+    gtk_entry_set_invisible_char(GTK_ENTRY(entry), '*');
+    gtk_box_pack_start(GTK_BOX(box), info, FALSE, FALSE, 6);
+    gtk_box_pack_start(GTK_BOX(box), entry, FALSE, FALSE, 0);
+    gtk_widget_show_all(dialog);
+    gtk_widget_grab_focus(entry);
+    gchar *pw = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *t = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (*t)
+            pw = g_strdup(t);
+    }
+    gtk_widget_destroy(dialog);
+    return pw;
+}
+
+static gboolean kp_job_done(gpointer data); /* defined below */
+
+/* The database is read in a worker thread (keepassxc-cli takes a moment). */
+typedef struct {
+    Browser *b;
+    char *host;
+    GPtrArray *entries;
+    char *error;
+    gboolean is_test;
+    int retried;
+} KpJob;
+
+static void kp_job_free(KpJob *job)
+{
+    for (guint i = 0; i < job->entries->len; i++)
+        kp_entry_free(g_ptr_array_index(job->entries, i));
+    g_ptr_array_free(job->entries, TRUE);
+    g_free(job->host);
+    g_free(job->error);
+    g_free(job);
+}
+
+static gpointer kp_job_thread(gpointer data)
+{
+    KpJob *job = data;
+    kp_load_entries(job->b->kp_db_path, job->b->kp_password, job->entries,
+                    &job->error);
+    g_idle_add(kp_job_done, job); /* back on the main thread */
+    return job;
+}
+
+typedef struct {
+    Browser *b;
+    char *title;
+    char *user;
+} FillResult;
+
+static void on_fill_js_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    FillResult *fr = user_data;
+    GError *err = NULL;
+    JSCValue *result = WEBKIT_IS_WEB_VIEW(source) ?
+        webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(source), res,
+                                                   &err) : NULL;
+    gboolean ok = !err && result && jsc_value_is_boolean(result) &&
+                  jsc_value_to_boolean(result);
+    GtkWidget *d;
+    if (ok) {
+        char buf[160];
+        g_snprintf(buf, sizeof(buf), "Filled %s (%s).", fr->title, fr->user);
+        d = gtk_message_dialog_new(GTK_WINDOW(fr->b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", buf);
+    } else {
+        d = gtk_message_dialog_new(GTK_WINDOW(fr->b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_WARNING, GTK_BUTTONS_OK,
+                                   err ? err->message
+                                       : "No login form found on this page.");
+    }
+    gtk_dialog_run(GTK_DIALOG(d));
+    gtk_widget_destroy(d);
+    if (result)
+        g_object_unref(result);
+    g_clear_error(&err);
+    g_free(fr->title);
+    g_free(fr->user);
+    g_free(fr);
+}
+
+/* Fill the current page's login form (password field + best-guess username
+ * field in the same form) with the given entry's values. */
+static void do_fill(Browser *b, KpEntry *e)
+{
+    Tab *tab = current_tab(b);
+    if (!tab)
+        return;
+    char *u = json_escape(e->username ? e->username : "");
+    char *p = json_escape(e->password ? e->password : "");
+    char *script = g_strdup_printf(
+        "(function(){"
+        "var u=%s,p=%s;"
+        "var all=Array.prototype.slice.call(document.querySelectorAll('input'));"
+        "var pwd=all.filter(function(el){return el.type==='password'&&el.offsetParent!==null;})[0];"
+        "if(!pwd)return false;"
+        "var scope=pwd.form?Array.prototype.slice.call(pwd.form.elements):all;"
+        "var user=scope.filter(function(el){return el!==pwd&&el.offsetParent!==null&&(el.type==='email'||el.type==='text')&&/user|email|login|account|name/i.test(el.name||'');})[0];"
+        "if(!user)user=scope.filter(function(el){return el!==pwd&&el.offsetParent!==null&&(el.type==='email'||el.type==='text');})[0];"
+        "function set(el,v){el.focus();el.value=v;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}"
+        "if(user)set(user,u);"
+        "set(pwd,p);pwd.focus();return true;"
+        "})()", u, p);
+    g_free(u);
+    g_free(p);
+    FillResult *fr = g_new0(FillResult, 1);
+    fr->b = b;
+    fr->title = g_strdup(e->title ? e->title : "");
+    fr->user = g_strdup(e->username ? e->username : "");
+    webkit_web_view_evaluate_javascript(tab->view, script, -1, NULL, NULL, NULL,
+                                    on_fill_js_done, fr);
+    g_free(script);
+}
+
+/* Pick one of several matching entries. Returns a borrowed KpEntry*. */
+static KpEntry *choose_entry(Browser *b, const char *host, GPtrArray *matches)
+{
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Choose password",
+                                                    GTK_WINDOW(b->window),
+                                                    GTK_DIALOG_MODAL,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Use", GTK_RESPONSE_OK,
+                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 420, 320);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    char hdr[160];
+    g_snprintf(hdr, sizeof(hdr), "%u entries for %s", (unsigned)matches->len, host);
+    GtkWidget *title = gtk_label_new(hdr);
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    GtkWidget *list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_BROWSE);
+    for (guint i = 0; i < matches->len; i++) {
+        KpEntry *e = g_ptr_array_index(matches, i);
+        char row[200];
+        g_snprintf(row, sizeof(row), "%s — %s", e->title ? e->title : "?",
+                   e->username ? e->username : "(no username)");
+        GtkWidget *label = gtk_label_new(row);
+        gtk_widget_set_halign(label, GTK_ALIGN_START);
+        gtk_list_box_insert(GTK_LIST_BOX(list), label, -1);
+    }
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scroll), list);
+    gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
+    gtk_widget_show_all(dialog);
+    GtkListBoxRow *first = gtk_list_box_get_row_at_index(GTK_LIST_BOX(list), 0);
+    if (first)
+        gtk_list_box_select_row(GTK_LIST_BOX(list), first);
+    KpEntry *pick = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        GtkListBoxRow *sel = gtk_list_box_get_selected_row(GTK_LIST_BOX(list));
+        int idx = sel ? gtk_list_box_row_get_index(sel) : -1;
+        if (idx >= 0 && idx < (int)matches->len)
+            pick = g_ptr_array_index(matches, idx);
+    }
+    gtk_widget_destroy(dialog);
+    return pick;
+}
+
+static void kp_start_job(Browser *b, const char *host, gboolean is_test)
+{
+    KpJob *job = g_new0(KpJob, 1);
+    job->b = b;
+    job->host = g_strdup(host ? host : "");
+    job->is_test = is_test;
+    job->entries = g_ptr_array_new();
+    g_thread_new("keepass", kp_job_thread, job);
+}
+
+static gboolean kp_job_done(gpointer data)
+{
+    KpJob *job = data;
+    Browser *b = job->b;
+    GtkWidget *d;
+
+    if (job->error && g_str_has_prefix(job->error, "INVALID_PW") && !job->retried) {
+        /* cached password was wrong: clear it and ask once more */
+        secure_free(&b->kp_password);
+        gchar *pw = ask_kp_password(b);
+        if (pw) {
+            b->kp_password = pw;
+            job->retried = 1;
+            g_thread_new("keepass", kp_job_thread, job);
+            return G_SOURCE_REMOVE;
+        }
+        kp_job_free(job);
+        return G_SOURCE_REMOVE; /* user cancelled */
+    }
+
+    if (job->error) {
+        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+                                   "KeePass: %s", job->error);
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+        kp_job_free(job);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (job->is_test) {
+        char msg[64];
+        g_snprintf(msg, sizeof(msg), "%u entries loaded from the database.",
+                   (unsigned)job->entries->len);
+        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+        kp_job_free(job);
+        return G_SOURCE_REMOVE;
+    }
+
+    GPtrArray *matches = g_ptr_array_new();
+    for (guint i = 0; i < job->entries->len; i++) {
+        KpEntry *e = g_ptr_array_index(job->entries, i);
+        if (kp_entry_matches_host(e, job->host))
+            g_ptr_array_add(matches, e);
+    }
+    KpEntry *pick = NULL;
+    if (matches->len == 1)
+        pick = g_ptr_array_index(matches, 0);
+    else if (matches->len > 1)
+        pick = choose_entry(b, job->host, matches);
+    else {
+        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                                   "No KeePass entries found for %s.",
+                                   job->host);
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+    }
+    if (pick)
+        do_fill(b, pick);
+    g_ptr_array_free(matches, TRUE);
+    kp_job_free(job);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_fill_button_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    fill_login(b);
+}
+
+static void fill_login(Browser *b)
+{
+    Tab *tab = current_tab(b);
+    if (!tab)
+        return;
+    GtkWidget *d;
+    if (!b->kp_db_path) {
+        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                                   "No KeePass database configured.\n\n"
+                                   "Choose a .kdbx file in Settings.");
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+        return;
+    }
+    const char *uri = webkit_web_view_get_uri(tab->view);
+    GError *err = NULL;
+    GUri *u = uri ? g_uri_parse(uri, G_URI_FLAGS_NONE, &err) : NULL;
+    char host[512] = {0};
+    if (u) {
+        const char *h = g_uri_get_host(u);
+        if (h)
+            g_strlcpy(host, h, sizeof(host));
+        g_uri_unref(u);
+    }
+    g_clear_error(&err);
+    if (!*host) {
+        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+                                   GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                                   "Open a login page first, then press "
+                                   "Ctrl+Shift+L again.");
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+        return;
+    }
+    if (!b->kp_password) {
+        b->kp_password = ask_kp_password(b);
+        if (!b->kp_password)
+            return; /* cancelled */
+    }
+    kp_start_job(b, host, FALSE);
+}
+
+static GtkWidget *find_named(GtkWidget *w, const char *name)
+{
+    if (gtk_widget_get_name(w) && strcmp(gtk_widget_get_name(w), name) == 0)
+        return w;
+    if (GTK_IS_CONTAINER(w)) {
+        GList *kids = gtk_container_get_children(GTK_CONTAINER(w));
+        GList *k;
+        GtkWidget *found = NULL;
+        for (k = kids; k && !found; k = k->next)
+            found = find_named(GTK_WIDGET(k->data), name);
+        g_list_free(kids);
+        return found;
+    }
+    return NULL;
+}
+
+static void choose_kp_database(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Choose KeePass database",
+                                                    GTK_WINDOW(b->window),
+                                                    GTK_FILE_CHOOSER_ACTION_OPEN,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Open", GTK_RESPONSE_ACCEPT,
+                                                    NULL);
+    GtkFileFilter *f = gtk_file_filter_new();
+    gtk_file_filter_add_pattern(f, "*.kdbx");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(chooser), f);
+    if (b->kp_db_path && g_file_test(b->kp_db_path, G_FILE_TEST_EXISTS))
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(chooser), b->kp_db_path);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        g_free(b->kp_db_path);
+        b->kp_db_path = fn;
+        secure_free(&b->kp_password); /* new db, old password no longer valid */
+        save_settings(b);
+    }
+    gtk_widget_destroy(chooser);
+
+    /* refresh the label in the settings dialog */
+    GtkWidget *dlg = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_DIALOG);
+    GtkWidget *lbl = dlg ? find_named(dlg, "kp-db-label") : NULL;
+    if (lbl) {
+        char *text = g_strdup_printf("Database: %s",
+                                     b->kp_db_path ? b->kp_db_path
+                                                   : "(none configured)");
+        gtk_label_set_text(GTK_LABEL(lbl), text);
+        g_free(text);
+    }
+}
+
+static void on_kp_test_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    if (!b->kp_db_path) {
+        GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(b->window),
+                                              GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+                                              GTK_BUTTONS_OK,
+                                              "Choose a database first.");
+        gtk_dialog_run(GTK_DIALOG(d));
+        gtk_widget_destroy(d);
+        return;
+    }
+    if (!b->kp_password) {
+        b->kp_password = ask_kp_password(b);
+        if (!b->kp_password)
+            return;
+    }
+    kp_start_job(b, NULL, TRUE);
+}
+
+/* Build the KeePass section of the settings dialog. */
+static void kp_build_settings_section(Browser *b, GtkWidget *content)
+{
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(content), sep, FALSE, FALSE, 0);
+
+    GtkWidget *hdr = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(hdr), "<b>KeePass passwords</b>");
+    gtk_widget_set_halign(hdr, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), hdr, FALSE, FALSE, 0);
+
+    if (!kp_have_backend()) {
+        GtkWidget *warn = gtk_label_new(
+            "keepassxc-cli not found in PATH. Install KeePassXC "
+            "(apt install keepassxc) to use password filling.");
+        gtk_widget_set_halign(warn, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(content), warn, FALSE, FALSE, 0);
+        return;
+    }
+
+    char db_text[512];
+    g_snprintf(db_text, sizeof(db_text), "Database: %s",
+               b->kp_db_path ? b->kp_db_path : "(none configured)");
+    GtkWidget *lbl = gtk_label_new(db_text);
+    gtk_widget_set_name(lbl, "kp-db-label");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_pack_start(GTK_BOX(content), lbl, FALSE, FALSE, 0);
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *choose = gtk_button_new_with_label("Choose database…");
+    g_signal_connect(choose, "clicked", G_CALLBACK(choose_kp_database), b);
+    GtkWidget *test = gtk_button_new_with_label("Test…");
+    g_signal_connect(test, "clicked", G_CALLBACK(on_kp_test_clicked), b);
+    gtk_box_pack_start(GTK_BOX(row), choose, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), test, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), row, FALSE, FALSE, 0);
 }
 
 /* ---------- keyboard shortcuts ---------- */
@@ -659,6 +1151,11 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
     if (keyval == GDK_KEY_F5) {
         if (tab)
             webkit_web_view_reload(tab->view);
+        return TRUE;
+    }
+    if ((mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) &&
+        (keyval == GDK_KEY_l || keyval == GDK_KEY_L)) {
+        fill_login(b);
         return TRUE;
     }
     if (mods != GDK_CONTROL_MASK)
@@ -879,6 +1376,8 @@ static void on_destroy(GtkWidget *w, Browser *b)
         adb_proxy_free(b->proxy);
         b->proxy = NULL;
     }
+    secure_free(&b->kp_password);
+    g_free(b->kp_db_path);
     gtk_main_quit();
 }
 
@@ -991,6 +1490,7 @@ int main(int argc, char *argv[])
     b->blocklist_file = blocklist ? g_strdup(blocklist) : NULL;
     b->adblock_enabled = TRUE;
     b->devtools_enabled = TRUE;
+    load_settings(b);
 
     b->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(b->window), APP_NAME);
@@ -1049,6 +1549,15 @@ int main(int argc, char *argv[])
     gtk_box_pack_start(GTK_BOX(toolbar), b->reload_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->url_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->blocked_button, FALSE, FALSE, 0);
+
+    b->kp_fill_button = gtk_button_new_from_icon_name("dialog-password",
+                                                      GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_widget_set_tooltip_text(b->kp_fill_button,
+                                "Fill login form from KeePass (Ctrl+Shift+L)");
+    g_signal_connect(b->kp_fill_button, "clicked",
+                     G_CALLBACK(on_fill_button_clicked), b);
+    gtk_box_pack_start(GTK_BOX(toolbar), b->kp_fill_button, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), close_tab_button, FALSE, FALSE, 0);
