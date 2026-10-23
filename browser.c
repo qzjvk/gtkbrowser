@@ -357,10 +357,11 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     tab->icon_image = gtk_image_new_from_icon_name("web-browser", GTK_ICON_SIZE_MENU);
     tab->title_label = gtk_label_new("New Tab");
     gtk_label_set_ellipsize(GTK_LABEL(tab->title_label), PANGO_ELLIPSIZE_END);
-    /* Minimum width zero: with many tabs open the window must still be
-     * resizable to any size. GTK scales the tabs down and the label
-     * ellipsizes when the strip runs out of room. */
-    gtk_widget_set_size_request(tab->title_label, 0, -1);
+    /* GtkNotebook allocates each tab its minimum width, so this minimum
+     * (in characters) is the visible tab width: the title stays readable.
+     * The notebook is scrollable, so the window's minimum size is one tab
+     * plus the arrows — it stays constant no matter how many tabs are open. */
+    gtk_label_set_width_chars(GTK_LABEL(tab->title_label), 20);
     GtkWidget *close_btn = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_MENU);
     gtk_button_set_relief(GTK_BUTTON(close_btn), GTK_RELIEF_NONE);
     gtk_widget_set_tooltip_text(close_btn, "Close tab");
@@ -1498,6 +1499,9 @@ int main(int argc, char *argv[])
 
     b->notebook = gtk_notebook_new();
     gtk_notebook_set_show_border(GTK_NOTEBOOK(b->notebook), FALSE);
+    /* Scrollable so many tabs use arrows instead of forcing the window's
+     * minimum size to grow with each new tab. */
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(b->notebook), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), b->notebook, TRUE, TRUE, 0);
 
     g_signal_connect(b->back_button, "clicked", G_CALLBACK(on_back_clicked), b);
