@@ -34,10 +34,20 @@
 
 #define APP_NAME "GtkBrowser"
 #define HOME_URL "https://duckduckgo.com"
-#define SEARCH_URL "https://duckduckgo.com/?q=%s"
 /* Cap on the visible tab title length (the tooltip keeps the full text).
  * Bounding the natural label width keeps the tab strip predictable. */
 #define TAB_LABEL_MAX_CHARS 24
+/* Maximum number of URLs kept in the history. */
+#define HISTORY_MAX 500
+
+typedef struct { const char *name; const char *base; } SearchEngine;
+static const SearchEngine SEARCH_ENGINES[] = {
+    { "DuckDuckGo", "https://duckduckgo.com/?q=" },
+    { "Google", "https://www.google.com/search?q=" },
+    { "Startpage", "https://www.startpage.com/sp/search?query=" },
+    { "Bing", "https://www.bing.com/search?q=" },
+};
+#define N_SEARCH_ENGINES ((int)G_N_ELEMENTS(SEARCH_ENGINES))
 
 typedef struct {
     GtkWidget *window;
@@ -58,6 +68,11 @@ typedef struct {
     gchar *kp_password;  /* session cache of the db password */
     GSocketService *control_service;
     gchar *control_socket_path;
+    GPtrArray *history;      /* char* URIs, most recent first */
+    GPtrArray *bookmarks;    /* Bookmark* */
+    GtkWidget *bookmarks_button;
+    GtkListStore *url_model; /* autocomplete suggestions */
+    int search_engine;       /* index into SEARCH_ENGINES */
 } Browser;
 
 typedef struct {
@@ -66,6 +81,11 @@ typedef struct {
     GtkWidget *icon_image;
     GtkWidget *title_label;
 } Tab;
+
+typedef struct {
+    char *uri;
+    char *title;
+} Bookmark;
 
 /* forward declarations */
 static GtkWidget *new_tab(Browser *b, const char *uri);
@@ -80,6 +100,11 @@ static void fill_login(Browser *b);
 static void choose_kp_database(GtkButton *btn, Browser *b);
 static void kp_build_settings_section(Browser *b, GtkWidget *content);
 static void on_blocked_clicked(GtkButton *btn, Browser *b);
+static void history_add(Browser *b, const char *uri);
+static void refresh_url_model(Browser *b);
+static void bookmark_toggle(Browser *b, const char *uri, const char *title);
+static void cycle_tab(Browser *b, int delta);
+static void on_engine_changed(GtkComboBox *combo, Browser *b);
 
 /* ---------- helpers ---------- */
 
@@ -187,7 +212,8 @@ static void navigate_from_entry(Browser *b)
         g_free(uri);
     } else {
         char *q = g_uri_escape_string(text, NULL, TRUE);
-        char *url = g_strdup_printf(SEARCH_URL, q);
+        char *url = g_strdup_printf("%s%s",
+                                    SEARCH_ENGINES[b->search_engine].base, q);
         g_free(q);
         load_uri(b, url);
         g_free(url);
@@ -225,6 +251,11 @@ static gboolean on_tab_button_press(GtkWidget *w, GdkEventButton *e, gpointer pa
 static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab)
 {
     Browser *b = tab->browser;
+    if (event == WEBKIT_LOAD_FINISHED) {
+        const char *uri = webkit_web_view_get_uri(view);
+        if (uri)
+            history_add(b, uri);
+    }
     if (current_tab(b) == tab) {
         update_url_entry(b, tab);
         update_nav_buttons(b, tab);
@@ -582,10 +613,23 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
 
     gtk_box_pack_start(GTK_BOX(content), devtools_check, FALSE, FALSE, 0);
 
+    GtkWidget *engine_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(engine_row, GTK_ALIGN_START);
+    GtkWidget *engine_label = gtk_label_new("Search engine:");
+    GtkWidget *engine_combo = gtk_combo_box_text_new();
+    for (int i = 0; i < N_SEARCH_ENGINES; i++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(engine_combo),
+                                       SEARCH_ENGINES[i].name);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(engine_combo), b->search_engine);
+    gtk_box_pack_start(GTK_BOX(engine_row), engine_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(engine_row), engine_combo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), engine_row, FALSE, FALSE, 0);
+
     kp_build_settings_section(b, content);
 
     g_signal_connect(adblock_check, "toggled", G_CALLBACK(on_adblock_toggled), b);
     g_signal_connect(devtools_check, "toggled", G_CALLBACK(on_devtools_toggled), b);
+    g_signal_connect(engine_combo, "changed", G_CALLBACK(on_engine_changed), b);
 
     gtk_widget_show_all(dialog);
     gtk_dialog_run(GTK_DIALOG(dialog));
@@ -638,8 +682,12 @@ static void load_settings(Browser *b)
 {
     GKeyFile *kf = g_key_file_new();
     char *path = settings_path();
-    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
         b->kp_db_path = g_key_file_get_string(kf, "keepass", "db", NULL);
+        int se = g_key_file_get_integer(kf, "search", "engine", NULL);
+        if (se >= 0 && se < N_SEARCH_ENGINES)
+            b->search_engine = se;
+    }
     g_key_file_unref(kf);
     g_free(path);
 }
@@ -649,6 +697,7 @@ static void save_settings(Browser *b)
     GKeyFile *kf = g_key_file_new();
     if (b->kp_db_path)
         g_key_file_set_string(kf, "keepass", "db", b->kp_db_path);
+    g_key_file_set_integer(kf, "search", "engine", b->search_engine);
     char *path = settings_path();
     char *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
@@ -1074,6 +1123,344 @@ static void kp_build_settings_section(Browser *b, GtkWidget *content)
     gtk_box_pack_start(GTK_BOX(content), row, FALSE, FALSE, 0);
 }
 
+/* ---------- history, bookmarks, autocomplete ---------- */
+
+static gboolean is_web_uri(const char *uri)
+{
+    return uri && (g_str_has_prefix(uri, "http://") ||
+                   g_str_has_prefix(uri, "https://"));
+}
+
+static void ensure_data_dir(void)
+{
+    char *dir = g_build_filename(g_get_user_config_dir(), "gtkbrowser", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+}
+
+static char *history_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "gtkbrowser",
+                            "history", NULL);
+}
+
+static char *bookmarks_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "gtkbrowser",
+                            "bookmarks", NULL);
+}
+
+static void history_save(Browser *b)
+{
+    if (!b->history)
+        return;
+    ensure_data_dir();
+    GString *s = g_string_new(NULL);
+    for (guint i = 0; i < b->history->len; i++)
+        g_string_append_printf(s, "%s\n",
+                               (const char *)g_ptr_array_index(b->history, i));
+    char *path = history_path();
+    g_file_set_contents(path, s->str, s->len, NULL);
+    g_free(path);
+    g_string_free(s, TRUE);
+}
+
+static void load_history(Browser *b)
+{
+    ensure_data_dir();
+    b->history = g_ptr_array_new();
+    char *path = history_path();
+    GError *err = NULL;
+    gchar *contents = NULL;
+    if (g_file_get_contents(path, &contents, NULL, &err)) {
+        gchar **lines = g_strsplit(contents, "\n", -1);
+        for (int i = 0; lines[i]; i++)
+            if (*lines[i])
+                g_ptr_array_add(b->history, g_strdup(lines[i]));
+        g_strfreev(lines);
+        g_free(contents);
+    }
+    g_clear_error(&err);
+    g_free(path);
+    while (b->history->len > HISTORY_MAX) {
+        g_free(g_ptr_array_index(b->history, b->history->len - 1));
+        g_ptr_array_remove_index(b->history, b->history->len - 1);
+    }
+}
+
+static void history_add(Browser *b, const char *uri)
+{
+    if (!b->history || !is_web_uri(uri))
+        return;
+    /* move the URL to the front (drops older duplicates) */
+    for (guint i = 0; i < b->history->len; i++) {
+        char *old = g_ptr_array_index(b->history, i);
+        if (g_strcmp0(old, uri) == 0) {
+            g_free(old);
+            g_ptr_array_remove_index(b->history, i);
+            break;
+        }
+    }
+    g_ptr_array_insert(b->history, 0, g_strdup(uri));
+    while (b->history->len > HISTORY_MAX) {
+        g_free(g_ptr_array_index(b->history, b->history->len - 1));
+        g_ptr_array_remove_index(b->history, b->history->len - 1);
+    }
+    history_save(b);
+    refresh_url_model(b);
+}
+
+static void bookmarks_save(Browser *b)
+{
+    if (!b->bookmarks)
+        return;
+    ensure_data_dir();
+    GString *s = g_string_new(NULL);
+    for (guint i = 0; i < b->bookmarks->len; i++) {
+        Bookmark *bm = g_ptr_array_index(b->bookmarks, i);
+        char *title = g_strdup(bm->title);
+        for (char *c = title; *c; c++)
+            if (*c == '\t' || *c == '\n')
+                *c = ' ';
+        g_string_append_printf(s, "%s\t%s\n", bm->uri, title);
+        g_free(title);
+    }
+    char *path = bookmarks_path();
+    g_file_set_contents(path, s->str, s->len, NULL);
+    g_free(path);
+    g_string_free(s, TRUE);
+}
+
+static void load_bookmarks(Browser *b)
+{
+    ensure_data_dir();
+    b->bookmarks = g_ptr_array_new();
+    char *path = bookmarks_path();
+    GError *err = NULL;
+    gchar *contents = NULL;
+    if (g_file_get_contents(path, &contents, NULL, &err)) {
+        gchar **lines = g_strsplit(contents, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            if (!*lines[i])
+                continue;
+            Bookmark *bm = g_new0(Bookmark, 1);
+            char *tab = strchr(lines[i], '\t');
+            if (tab) {
+                *tab = '\0';
+                bm->title = g_strdup(tab + 1);
+            } else {
+                bm->title = g_strdup(lines[i]);
+            }
+            bm->uri = g_strdup(lines[i]);
+            g_ptr_array_add(b->bookmarks, bm);
+        }
+        g_strfreev(lines);
+        g_free(contents);
+    }
+    g_clear_error(&err);
+    g_free(path);
+}
+
+static void bookmark_remove(Browser *b, const char *uri)
+{
+    if (!b->bookmarks)
+        return;
+    for (guint i = 0; i < b->bookmarks->len; i++) {
+        Bookmark *bm = g_ptr_array_index(b->bookmarks, i);
+        if (g_strcmp0(bm->uri, uri) == 0) {
+            g_free(bm->uri);
+            g_free(bm->title);
+            g_free(bm);
+            g_ptr_array_remove_index(b->bookmarks, i);
+            break;
+        }
+    }
+    bookmarks_save(b);
+    refresh_url_model(b);
+}
+
+static void bookmark_add(Browser *b, const char *uri, const char *title)
+{
+    if (!b->bookmarks || !is_web_uri(uri))
+        return;
+    for (guint i = 0; i < b->bookmarks->len; i++)
+        if (g_strcmp0(((Bookmark *)g_ptr_array_index(b->bookmarks, i))->uri,
+                      uri) == 0)
+            return;
+    Bookmark *bm = g_new0(Bookmark, 1);
+    bm->uri = g_strdup(uri);
+    bm->title = g_strdup(title && *title ? title : uri);
+    g_ptr_array_add(b->bookmarks, bm);
+    bookmarks_save(b);
+    refresh_url_model(b);
+}
+
+static void bookmark_toggle(Browser *b, const char *uri, const char *title)
+{
+    if (!b->bookmarks || !is_web_uri(uri))
+        return;
+    for (guint i = 0; i < b->bookmarks->len; i++)
+        if (g_strcmp0(((Bookmark *)g_ptr_array_index(b->bookmarks, i))->uri,
+                      uri) == 0) {
+            bookmark_remove(b, uri);
+            return;
+        }
+    bookmark_add(b, uri, title);
+}
+
+/* Rebuild the URL-bar completion list: bookmarks first (stable), then
+ * history (most recent first), duplicates dropped. */
+static void refresh_url_model(Browser *b)
+{
+    if (!b->url_model)
+        return;
+    gtk_list_store_clear(b->url_model);
+    GPtrArray *seen = g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *lists[2] = { b->bookmarks ? b->bookmarks : NULL,
+                            b->history ? b->history : NULL };
+    for (int which = 0; which < 2; which++) {
+        if (!lists[which])
+            continue;
+        for (guint i = 0; i < lists[which]->len; i++) {
+            const char *uri;
+            if (which == 0)
+                uri = ((Bookmark *)g_ptr_array_index(lists[which], i))->uri;
+            else
+                uri = g_ptr_array_index(lists[which], i);
+            gboolean dup = FALSE;
+            for (guint j = 0; j < seen->len; j++)
+                if (g_strcmp0(g_ptr_array_index(seen, j), uri) == 0)
+                    dup = TRUE;
+            if (dup)
+                continue;
+            GtkTreeIter iter;
+            gtk_list_store_append(b->url_model, &iter);
+            gtk_list_store_set(b->url_model, &iter, 0, uri, -1);
+            g_ptr_array_add(seen, g_strdup(uri));
+        }
+    }
+    g_ptr_array_unref(seen);
+}
+
+/* ---------- bookmarks manager ---------- */
+
+static void on_bookmark_remove_clicked(GtkButton *btn, gpointer list);
+
+static void build_bookmarks_list(Browser *b, GtkWidget *list)
+{
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(list));
+    for (GList *l = rows; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(rows);
+    if (b->bookmarks->len == 0) {
+        GtkWidget *empty = gtk_label_new(
+            "No bookmarks yet — press Ctrl+D on a page to add one.");
+        gtk_box_pack_start(GTK_BOX(list), empty, FALSE, FALSE, 0);
+        return;
+    }
+    for (guint i = 0; i < b->bookmarks->len; i++) {
+        Bookmark *bm = g_ptr_array_index(b->bookmarks, i);
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        GtkWidget *lbl = gtk_label_new(NULL);
+        char *text = g_strdup_printf("%s\n%s", bm->title, bm->uri);
+        gtk_label_set_text(GTK_LABEL(lbl), text);
+        gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
+        gtk_label_set_selectable(GTK_LABEL(lbl), TRUE);
+        g_free(text);
+        gtk_widget_set_hexpand(lbl, TRUE);
+        GtkWidget *remove = gtk_button_new_with_mnemonic("_Remove");
+        gtk_box_pack_start(GTK_BOX(row), lbl, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(row), remove, FALSE, FALSE, 0);
+        g_object_set_data_full(G_OBJECT(row), "uri", g_strdup(bm->uri),
+                               g_free);
+        g_signal_connect(remove, "clicked",
+                         G_CALLBACK(on_bookmark_remove_clicked), list);
+        gtk_box_pack_start(GTK_BOX(list), row, FALSE, FALSE, 0);
+    }
+}
+
+static void on_bookmark_remove_clicked(GtkButton *btn, gpointer list)
+{
+    (void)btn;
+    GtkWidget *row = gtk_widget_get_parent(GTK_WIDGET(btn));
+    char *uri = row ? g_object_get_data(G_OBJECT(row), "uri") : NULL;
+    Browser *b = g_object_get_data(G_OBJECT(list), "browser");
+    if (uri && b) {
+        bookmark_remove(b, uri);
+        build_bookmarks_list(b, GTK_WIDGET(list));
+    }
+}
+
+static void on_bookmark_row_activated(GtkListBox *list, GtkListBoxRow *row,
+                                      Browser *b)
+{
+    (void)list;
+    GtkWidget *inner = gtk_bin_get_child(GTK_BIN(row));
+    char *uri = inner ? g_object_get_data(G_OBJECT(inner), "uri") : NULL;
+    if (uri)
+        new_tab(b, uri);
+}
+
+static void on_bookmarks_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Bookmarks", GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        "_Close", GTK_RESPONSE_CLOSE, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 400);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+
+    GtkWidget *hint = gtk_label_new(
+        "Double-click a bookmark to open it in a new tab. "
+        "Ctrl+D toggles the current page.");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_box_pack_start(GTK_BOX(content), hint, FALSE, FALSE, 0);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+
+    GtkWidget *list = gtk_list_box_new();
+    gtk_container_add(GTK_CONTAINER(scroll), list);
+    gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
+
+    g_object_set_data(G_OBJECT(list), "browser", b);
+    build_bookmarks_list(b, list);
+    g_signal_connect(list, "row-activated",
+                     G_CALLBACK(on_bookmark_row_activated), b);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+/* ---------- tab cycling ---------- */
+
+static void cycle_tab(Browser *b, int delta)
+{
+    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    int n = gtk_notebook_get_n_pages(nb);
+    if (n <= 1)
+        return;
+    int cur = gtk_notebook_get_current_page(nb);
+    int next = ((cur + delta) % n + n) % n;
+    if (next != cur)
+        gtk_notebook_set_current_page(nb, next);
+}
+
+/* ---------- search engine ---------- */
+
+static void on_engine_changed(GtkComboBox *combo, Browser *b)
+{
+    int idx = gtk_combo_box_get_active(combo);
+    if (idx >= 0 && idx < N_SEARCH_ENGINES) {
+        b->search_engine = idx;
+        save_settings(b);
+    }
+}
+
 /* ---------- keyboard shortcuts ---------- */
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
@@ -1090,6 +1477,13 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
     if ((mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) &&
         (keyval == GDK_KEY_l || keyval == GDK_KEY_L)) {
         fill_login(b);
+        return TRUE;
+    }
+    /* Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; Shift+Tab arrives as
+     * ISO_Left_Tab on some keymaps. */
+    if ((keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) &&
+        (mods & GDK_CONTROL_MASK)) {
+        cycle_tab(b, (mods & GDK_SHIFT_MASK) ? -1 : 1);
         return TRUE;
     }
     if (mods != GDK_CONTROL_MASK)
@@ -1133,6 +1527,27 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
         if (tab)
             webkit_web_view_set_zoom_level(tab->view, 1.0);
         return TRUE;
+    case GDK_KEY_d:
+        if (tab)
+            bookmark_toggle(b, webkit_web_view_get_uri(tab->view),
+                            webkit_web_view_get_title(tab->view));
+        return TRUE;
+    case GDK_KEY_1:
+    case GDK_KEY_2:
+    case GDK_KEY_3:
+    case GDK_KEY_4:
+    case GDK_KEY_5:
+    case GDK_KEY_6:
+    case GDK_KEY_7:
+    case GDK_KEY_8:
+    case GDK_KEY_9: {
+        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+        int n = gtk_notebook_get_n_pages(nb);
+        int idx = keyval - GDK_KEY_1;
+        if (n > 0)
+            gtk_notebook_set_current_page(nb, MIN(idx, n - 1));
+        return TRUE;
+    }
     }
     return FALSE;
 }
@@ -1306,6 +1721,23 @@ static void on_destroy(GtkWidget *w, Browser *b)
     }
     secure_free(&b->kp_password);
     g_free(b->kp_db_path);
+    history_save(b);
+    bookmarks_save(b);
+    if (b->history) {
+        g_ptr_array_set_free_func(b->history, g_free);
+        g_ptr_array_unref(b->history);
+        b->history = NULL;
+    }
+    if (b->bookmarks) {
+        for (guint i = 0; i < b->bookmarks->len; i++) {
+            Bookmark *bm = g_ptr_array_index(b->bookmarks, i);
+            g_free(bm->uri);
+            g_free(bm->title);
+            g_free(bm);
+        }
+        g_ptr_array_unref(b->bookmarks);
+        b->bookmarks = NULL;
+    }
     gtk_main_quit();
 }
 
@@ -1419,6 +1851,8 @@ int main(int argc, char *argv[])
     b->adblock_enabled = TRUE;
     b->devtools_enabled = TRUE;
     load_settings(b);
+    load_history(b);
+    load_bookmarks(b);
 
     b->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(b->window), APP_NAME);
@@ -1447,6 +1881,13 @@ int main(int argc, char *argv[])
     gtk_entry_set_placeholder_text(GTK_ENTRY(b->url_entry), "Search or enter address");
     gtk_widget_set_hexpand(b->url_entry, TRUE);
     gtk_widget_set_tooltip_text(b->url_entry, "Ctrl+L to focus");
+    b->url_model = gtk_list_store_new(1, G_TYPE_STRING);
+    GtkEntryCompletion *completion = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(b->url_model));
+    gtk_entry_completion_set_text_column(completion, 0);
+    gtk_entry_completion_set_minimum_key_length(completion, 2);
+    gtk_entry_set_completion(GTK_ENTRY(b->url_entry), completion);
+    refresh_url_model(b);
 
     GtkWidget *settings_button = gtk_button_new_from_icon_name("preferences-system",
                                                                GTK_ICON_SIZE_LARGE_TOOLBAR);
@@ -1484,6 +1925,14 @@ int main(int argc, char *argv[])
     g_signal_connect(b->kp_fill_button, "clicked",
                      G_CALLBACK(on_fill_button_clicked), b);
     gtk_box_pack_start(GTK_BOX(toolbar), b->kp_fill_button, FALSE, FALSE, 0);
+
+    b->bookmarks_button = gtk_button_new_from_icon_name("starred",
+                                                       GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_widget_set_tooltip_text(b->bookmarks_button,
+                                "Bookmarks — Ctrl+D toggles the current page");
+    g_signal_connect(b->bookmarks_button, "clicked",
+                     G_CALLBACK(on_bookmarks_clicked), b);
+    gtk_box_pack_start(GTK_BOX(toolbar), b->bookmarks_button, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
