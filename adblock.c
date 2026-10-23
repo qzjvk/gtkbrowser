@@ -123,6 +123,7 @@ struct AdbProxy {
     GSocketService *service;
     GPtrArray *extra_hosts;
     int port;
+    gint blocked; /* atomic: total requests refused so far */
 };
 
 static gboolean host_matches(const char *host, const char *entry)
@@ -324,6 +325,7 @@ static void *proxy_thread(gpointer data)
     }
 
     if (host_blocked(p, host)) {
+        g_atomic_int_inc(&p->blocked);
         static const char r403[] =
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(cfd, r403, sizeof(r403) - 1);
@@ -453,6 +455,11 @@ void adb_proxy_stop(AdbProxy *p)
 int adb_proxy_port(const AdbProxy *p)
 {
     return p->port;
+}
+
+guint64 adb_proxy_blocked_count(const AdbProxy *p)
+{
+    return p ? (guint64)g_atomic_int_get(&p->blocked) : 0;
 }
 
 void adb_proxy_load_file(AdbProxy *p, const char *path)

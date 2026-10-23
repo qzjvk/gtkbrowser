@@ -22,3 +22,6 @@ int       adb_proxy_port(const AdbProxy *p);
 
 /* Load extra blocklist domains from a file (one per line, # comments). */
 void      adb_proxy_load_file(AdbProxy *p, const char *path);
+
+/* Total number of requests blocked so far (thread-safe; read from the UI). */
+guint64   adb_proxy_blocked_count(const AdbProxy *p);

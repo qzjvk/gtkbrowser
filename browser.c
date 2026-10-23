@@ -47,6 +47,7 @@ typedef struct {
     GtkWidget *forward_button;
     GtkWidget *reload_button;
     GtkWidget *progress;
+    GtkWidget *blocked_label;
     AdbProxy *proxy;
     gboolean adblock_enabled;
     gboolean devtools_enabled;
@@ -73,6 +74,7 @@ static void update_window_title(Browser *b, Tab *tab);
 static void relayout_tabs(Browser *b);
 static char *normalize_uri(const char *s);
 static void set_adblock_enabled(Browser *b, gboolean enabled);
+static gboolean update_blocked_label(gpointer data);
 
 /* ---------- helpers ---------- */
 
@@ -575,6 +577,20 @@ static void on_devtools_toggled(GtkToggleButton *btn, Browser *b)
     }
 }
 
+/* Refresh the toolbar "trackers blocked" counter. Runs from a 1s timeout
+ * so it stays live while pages load. */
+static gboolean update_blocked_label(gpointer data)
+{
+    Browser *b = data;
+    if (!b->blocked_label)
+        return G_SOURCE_CONTINUE;
+    guint64 count = b->proxy ? adb_proxy_blocked_count(b->proxy) : 0;
+    char buf[48];
+    g_snprintf(buf, sizeof(buf), "\xF0\x9F\x9B\xA1 %llu", (unsigned long long)count);
+    gtk_label_set_text(GTK_LABEL(b->blocked_label), buf);
+    return G_SOURCE_CONTINUE;
+}
+
 static void on_settings_clicked(GtkButton *btn, Browser *b)
 {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Settings",
@@ -593,6 +609,14 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(devtools_check), b->devtools_enabled);
 
     gtk_box_pack_start(GTK_BOX(content), adblock_check, FALSE, FALSE, 0);
+
+    char blocked_buf[48];
+    g_snprintf(blocked_buf, sizeof(blocked_buf), "Trackers blocked so far: %llu",
+               (unsigned long long)(b->proxy ? adb_proxy_blocked_count(b->proxy) : 0));
+    GtkWidget *blocked_info = gtk_label_new(blocked_buf);
+    gtk_widget_set_halign(blocked_info, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), blocked_info, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(content), devtools_check, FALSE, FALSE, 0);
 
     g_signal_connect(adblock_check, "toggled", G_CALLBACK(on_adblock_toggled), b);
@@ -978,10 +1002,14 @@ int main(int argc, char *argv[])
     gtk_widget_set_tooltip_text(new_tab_button, "New tab (Ctrl+T)");
     gtk_widget_set_tooltip_text(close_tab_button, "Close tab (Ctrl+W)");
 
+    b->blocked_label = gtk_label_new("\xF0\x9F\x9B\xA1 0");
+    gtk_widget_set_tooltip_text(b->blocked_label, "Trackers blocked");
+
     gtk_box_pack_start(GTK_BOX(toolbar), b->back_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->forward_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->reload_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), b->url_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), b->blocked_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), close_tab_button, FALSE, FALSE, 0);
@@ -1032,6 +1060,9 @@ int main(int argc, char *argv[])
 
     /* first tab: URL from the command line, or the home page */
     new_tab(b, initial);
+
+    update_blocked_label(b);
+    g_timeout_add(1000, update_blocked_label, b);
 
     gtk_widget_show_all(b->window);
     gtk_main();
