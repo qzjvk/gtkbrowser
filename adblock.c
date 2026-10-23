@@ -16,6 +16,8 @@
 #include <poll.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <netdb.h>
 
 /* ---------- blocklist ---------- */
 
@@ -296,10 +298,11 @@ static void *proxy_thread(gpointer data)
         goto out;
 
     char host[512] = {0};
-    int port = 443;
+    int port = 80; /* plain HTTP default */
     gboolean is_connect = (g_ascii_strcasecmp(method, "CONNECT") == 0);
     if (is_connect) {
-        /* target = host:port */
+        /* target = host:port; CONNECT defaults to 443 */
+        port = 443;
         char *colon = strrchr(target, ':');
         if (colon) {
             *colon = '\0';
@@ -327,25 +330,38 @@ static void *proxy_thread(gpointer data)
         goto out;
     }
 
-    /* Connect upstream. g_inet_socket_address_new_from_string() resolves the
-     * host (DNS) and yields an address whose family we use to create the
-     * socket. */
-    GSocketAddress *ua = g_inet_socket_address_new_from_string(host, port);
-    GSocket *up = NULL;
-    if (ua) {
-        GSocketFamily family = g_socket_address_get_family(ua);
-        up = g_socket_new(family, G_SOCKET_TYPE_STREAM,
-                          G_SOCKET_PROTOCOL_DEFAULT, NULL);
+    /* Connect upstream. Resolve with getaddrinfo() directly: GLib's
+     * g_inet_socket_address_new_from_string() fails to resolve in some
+     * environments (e.g. GLib 2.84 on this box) even when the system
+     * resolver works, which made every request 502 and pages blank. Try
+     * each resolved address until one connects (IPv6/IPv4 happy path). */
+    char portstr[16];
+    g_snprintf(portstr, sizeof(portstr), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    int ufd = -1;
+    if (getaddrinfo(host, portstr, &hints, &res) == 0 && res) {
+        for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+            int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (fd < 0)
+                continue;
+            if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+                ufd = fd;
+                break;
+            }
+            close(fd);
+        }
+        freeaddrinfo(res);
     }
-    if (!up || !g_socket_connect(up, ua, NULL, NULL)) {
+    if (ufd < 0) {
         static const char r502[] =
             "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(cfd, r502, sizeof(r502) - 1);
-        g_clear_object(&up);
-        g_clear_object(&ua);
         goto out;
     }
-    int ufd = g_socket_get_fd(up);
 
     if (is_connect) {
         static const char ok[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -357,8 +373,7 @@ static void *proxy_thread(gpointer data)
     }
 
     pipe_fds(cfd, ufd);
-    g_object_unref(up);
-    g_object_unref(ua);
+    close(ufd);
 
 out:
     g_object_unref(client);
