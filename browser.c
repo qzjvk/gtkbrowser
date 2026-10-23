@@ -73,6 +73,7 @@ typedef struct {
     GtkWidget *bookmarks_button;
     GtkListStore *url_model; /* autocomplete suggestions */
     int search_engine;       /* index into SEARCH_ENGINES */
+    gboolean fullscreen;     /* F11 state */
 } Browser;
 
 typedef struct {
@@ -80,6 +81,7 @@ typedef struct {
     WebKitWebView *view;
     GtkWidget *icon_image;
     GtkWidget *title_label;
+    gchar *source_file;      /* temp file behind a Ctrl+U view-source load */
 } Tab;
 
 typedef struct {
@@ -105,6 +107,7 @@ static void refresh_url_model(Browser *b);
 static void bookmark_toggle(Browser *b, const char *uri, const char *title);
 static void cycle_tab(Browser *b, int delta);
 static void on_engine_changed(GtkComboBox *combo, Browser *b);
+static void drop_source_file(Tab *tab, const char *uri);
 
 /* ---------- helpers ---------- */
 
@@ -144,12 +147,30 @@ static gboolean looks_like_url(const char *s)
     return strchr(s, '.') != NULL;
 }
 
+/* Padlock in the URL bar: green for HTTPS, red for plain HTTP. This
+ * WebKit build has no TLS-status API, so the scheme is the indicator. */
+static void update_security_icon(Browser *b, const char *uri)
+{
+    const char *icon = NULL;
+    const char *tip = NULL;
+    if (uri && g_ascii_strncasecmp(uri, "https://", 8) == 0) {
+        icon = "security-high";
+        tip = "Secure connection (HTTPS)";
+    } else if (uri && g_ascii_strncasecmp(uri, "http://", 7) == 0) {
+        icon = "security-low";
+        tip = "Insecure connection (HTTP)";
+    }
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(b->url_entry), GTK_ENTRY_ICON_PRIMARY, icon);
+    gtk_entry_set_icon_tooltip_text(GTK_ENTRY(b->url_entry), GTK_ENTRY_ICON_PRIMARY, tip);
+}
+
 static void update_url_entry(Browser *b, Tab *tab)
 {
     if (!tab)
         return;
     const char *uri = webkit_web_view_get_uri(tab->view);
     gtk_entry_set_text(GTK_ENTRY(b->url_entry), uri ? uri : "");
+    update_security_icon(b, uri);
 }
 
 /* Cap the visible tab title at TAB_LABEL_MAX_CHARS (the tooltip keeps the
@@ -225,6 +246,9 @@ static void navigate_from_entry(Browser *b)
 static void close_tab(Browser *b, GtkWidget *page)
 {
     GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+    if (tab)
+        drop_source_file(tab, NULL);
     gtk_notebook_remove_page(nb, gtk_notebook_page_num(nb, page));
     if (gtk_notebook_get_n_pages(nb) == 0)
         gtk_widget_destroy(b->window);
@@ -238,7 +262,8 @@ static void on_tab_close_clicked(GtkWidget *page, gpointer unused)
 
 static gboolean on_tab_button_press(GtkWidget *w, GdkEventButton *e, gpointer page)
 {
-    if (e->type == GDK_2BUTTON_PRESS) {
+    if (e->type == GDK_2BUTTON_PRESS ||
+        (e->type == GDK_BUTTON_PRESS && e->button == GDK_BUTTON_MIDDLE)) {
         Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
         close_tab(tab->browser, page);
         return TRUE;
@@ -253,6 +278,7 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab
     Browser *b = tab->browser;
     if (event == WEBKIT_LOAD_FINISHED) {
         const char *uri = webkit_web_view_get_uri(view);
+        drop_source_file(tab, uri);
         if (uri)
             history_add(b, uri);
     }
@@ -1461,6 +1487,103 @@ static void on_engine_changed(GtkComboBox *combo, Browser *b)
     }
 }
 
+/* ---------- page source / save (Ctrl+U / Ctrl+S) ----------
+ * This WebKit build has no view-source handler and no print_to_pdf, so the
+ * page's HTML is fetched with JavaScript. View source loads it from a temp
+ * file (a data: URI of the same size stalls the load in this build), and
+ * saving writes it to a file the user picks. */
+
+#define JS_GET_SOURCE "document.documentElement ? document.documentElement.outerHTML : ''"
+
+static char *page_slug(const char *title)
+{
+    char buf[128];
+    int n = 0;
+    if (title) {
+        for (int i = 0; title[i] && n < (int)sizeof(buf) - 1; i++)
+            if (g_ascii_isalnum((guchar)title[i]))
+                buf[n++] = title[i];
+    }
+    if (n == 0)
+        g_strlcpy(buf, "page", sizeof(buf));
+    else
+        buf[n] = '\0';
+    return g_strdup(buf);
+}
+
+static void on_source_fetched_view(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    Tab *tab = user_data;
+    JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, NULL);
+    char *html = val ? jsc_value_to_string(val) : g_strdup("");
+    g_free(tab->source_file);
+    tab->source_file = g_strdup_printf("%s/.gtkbrowser-source-%d.html",
+                                       g_get_tmp_dir(), (int)getpid());
+    g_file_set_contents(tab->source_file, html, (gssize)strlen(html), NULL);
+    char *uri = g_strdup_printf("file://%s", tab->source_file);
+    webkit_web_view_load_uri(tab->view, uri);
+    g_free(uri);
+    g_free(html);
+}
+
+static void on_source_fetched_save(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    Tab *tab = user_data;
+    Browser *b = tab->browser;
+    JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, NULL);
+    char *html = val ? jsc_value_to_string(val) : g_strdup("");
+    GtkWidget *dlg = gtk_file_chooser_dialog_new("Save page as HTML",
+                                                 GTK_WINDOW(b->window),
+                                                 GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                 "_Cancel", GTK_RESPONSE_CANCEL,
+                                                 "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    char *slug = page_slug(webkit_web_view_get_title(tab->view));
+    char *name = g_strdup_printf("%s.html", slug);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), name);
+    g_free(name);
+    g_free(slug);
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        char *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (path) {
+            GError *err = NULL;
+            if (!g_file_set_contents(path, html, (gssize)strlen(html), &err))
+                g_warning("Saving the page failed: %s",
+                          err ? err->message : "unknown error");
+            g_free(path);
+        }
+    }
+    gtk_widget_destroy(dlg);
+    g_free(html);
+}
+
+static void view_source_current(WebKitWebView *view, Tab *tab)
+{
+    webkit_web_view_evaluate_javascript(view, JS_GET_SOURCE, -1, NULL, NULL, NULL,
+                                        on_source_fetched_view, tab);
+}
+
+static void save_page_current(WebKitWebView *view, Tab *tab)
+{
+    webkit_web_view_evaluate_javascript(view, JS_GET_SOURCE, -1, NULL, NULL, NULL,
+                                        on_source_fetched_save, tab);
+}
+
+static void drop_source_file(Tab *tab, const char *uri)
+{
+    if (!tab->source_file)
+        return;
+    char *src_uri = g_strdup_printf("file://%s", tab->source_file);
+    gboolean keeping = uri && g_str_equal(uri, src_uri);
+    g_free(src_uri);
+    if (keeping)
+        return;
+    unlink(tab->source_file);
+    g_free(tab->source_file);
+    tab->source_file = NULL;
+}
+
 /* ---------- keyboard shortcuts ---------- */
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
@@ -1474,10 +1597,30 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
             webkit_web_view_reload(tab->view);
         return TRUE;
     }
+    if (keyval == GDK_KEY_F11) {
+        if (b->fullscreen)
+            gtk_window_unfullscreen(GTK_WINDOW(b->window));
+        else
+            gtk_window_fullscreen(GTK_WINDOW(b->window));
+        b->fullscreen = !b->fullscreen;
+        return TRUE;
+    }
     if ((mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) &&
         (keyval == GDK_KEY_l || keyval == GDK_KEY_L)) {
         fill_login(b);
         return TRUE;
+    }
+    /* Alt+Left / Alt+Right navigate back / forward. */
+    if (mods == GDK_MOD1_MASK && tab) {
+        if (keyval == GDK_KEY_Left && webkit_web_view_can_go_back(tab->view)) {
+            webkit_web_view_go_back(tab->view);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Right && webkit_web_view_can_go_forward(tab->view)) {
+            webkit_web_view_go_forward(tab->view);
+            return TRUE;
+        }
+        return FALSE;
     }
     /* Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; Shift+Tab arrives as
      * ISO_Left_Tab on some keymaps. */
@@ -1531,6 +1674,14 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
         if (tab)
             bookmark_toggle(b, webkit_web_view_get_uri(tab->view),
                             webkit_web_view_get_title(tab->view));
+        return TRUE;
+    case GDK_KEY_u:
+        if (tab)
+            view_source_current(tab->view, tab);
+        return TRUE;
+    case GDK_KEY_s:
+        if (tab)
+            save_page_current(tab->view, tab);
         return TRUE;
     case GDK_KEY_1:
     case GDK_KEY_2:
