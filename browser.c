@@ -10,6 +10,7 @@
  *   gtkbrowser --list       list tabs (index<TAB>url<TAB>title)
  *   gtkbrowser --url        print the current tab's URL
  *   gtkbrowser --title      print the current tab's title
+ *   gtkbrowser --blocked    print how many tracker requests have been blocked
  *   gtkbrowser --focus N    switch to tab N
  *   gtkbrowser --close [N]  close tab N (default: current)
  *   gtkbrowser --quit       quit the running instance
@@ -797,6 +798,10 @@ static char *handle_control_command(Browser *b, const char *cmd)
         const char *title = tab ? webkit_web_view_get_title(tab->view) : NULL;
         return g_strdup(title ? title : "");
     }
+    if (strcmp(cmd, "blocked") == 0) {
+        guint64 count = b->proxy ? adb_proxy_blocked_count(b->proxy) : 0;
+        return g_strdup_printf("%llu", (unsigned long long)count);
+    }
     if (g_str_has_prefix(cmd, "focus ")) {
         int n = atoi(cmd + 6);
         GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
@@ -933,6 +938,8 @@ int main(int argc, char *argv[])
             cli_cmd = g_strdup("url");
         } else if (g_strcmp0(argv[i], "--title") == 0) {
             cli_cmd = g_strdup("title");
+        } else if (g_strcmp0(argv[i], "--blocked") == 0) {
+            cli_cmd = g_strdup("blocked");
         } else if (g_strcmp0(argv[i], "--focus") == 0 && i + 1 < argc) {
             cli_cmd = g_strdup_printf("focus %s", argv[++i]);
         } else if (g_strcmp0(argv[i], "--close") == 0) {
