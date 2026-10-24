@@ -5,4 +5,5 @@ Comment=A minimal GTK3 + WebKitGTK browser with multiple windows and drag & drop
 Exec=@bindir@/gtkbrowser %u
 Icon=web-browser
 Terminal=false
+Keywords=web;browser;html;links;
 Categories=Network;WebBrowser;

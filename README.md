@@ -35,8 +35,8 @@ Installs:
   recently closed tab
 - Windows: right-click a tab → "Move to New Window" splits it into its own
   window (the page and its state are kept — no reload); the app quits when
-  the last window closes. The tab bar hides automatically in a window with a
-  single tab (toggle in Settings)
+  the last window closes. The tab strip is fully hidden in a single-tab
+  window (toggle in Settings)
 - Back / forward / reload-stop buttons with a thin load progress bar;
   `Alt+Left` / `Alt+Right` navigate back / forward
 - URL bar with search fallback and history/bookmark autocomplete — `Ctrl+L`
