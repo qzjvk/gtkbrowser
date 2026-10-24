@@ -55,6 +55,10 @@ Installs:
   `keepassxc-cli`; database chosen in Settings
 - `window.open()` and `target="_blank"` links open in new tabs
 - Downloads prompt a save-file dialog
+- Drag & drop: drop a link or URL anywhere on the window (toolbar, tab
+  strip, or page) and it opens — in a new tab, or the current tab if the
+  page accepts the drop. A dropped file is handed to the page when the page
+  handles drops itself, otherwise it opens in a new tab
 - New tab page and custom user agent configurable in Settings
 
 ## Notes
@@ -62,3 +66,7 @@ Installs:
 - If pages fail to load with sandbox errors (e.g. missing bubblewrap), run with
   `./gtkbrowser --no-sandbox`.
 - Developer tools are enabled: right-click → Inspect Element.
+- WebKitGTK does not expose dropped file contents to web pages (file access
+  is disabled in the GTK port — https://webkit.org/b/271957), so sites such
+  as Discord cannot upload files dragged from the file manager, even though
+  the drop event itself reaches the page.

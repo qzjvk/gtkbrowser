@@ -51,6 +51,24 @@ static const SearchEngine SEARCH_ENGINES[] = {
 };
 #define N_SEARCH_ENGINES ((int)G_N_ELEMENTS(SEARCH_ENGINES))
 
+/* drag & drop target atoms, interned once at startup */
+static GdkAtom atom_text_uri_list;
+static GdkAtom atom_text_plain;
+static GdkAtom atom_text_utf8;
+static GdkAtom atom_text_string;
+static GdkAtom atom_text_text;
+static GdkAtom atom_text_html;
+static GdkAtom atom_netscape_url;
+/* how long a drag may sit over the web view before the shell takes a
+ * drop the page refused; long enough for WebKit's async page query to
+ * settle, short enough that a held drag feels instant */
+#define DROP_SHELL_DELAY_MS 250
+/* after the shell accepted, re-assert the COPY status this long after the
+ * last motion so it outlives WebKit's async status re-send for that motion */
+#define DROP_STATUS_KEEP_MS 50
+/* cap on tabs opened by a single drop (a folder drag can carry many) */
+#define DROP_MAX_TABS 8
+
 typedef struct Tab Tab;
 
 typedef struct {
@@ -99,6 +117,14 @@ typedef struct Tab {
     GtkWidget *icon_image;
     GtkWidget *title_label;
     gchar *source_file;      /* temp file behind a Ctrl+U view-source load */
+    /* pending drag & drop state; see the "drag & drop" section */
+    GdkDragContext *drop_ctx;     /* drag currently over the view (ref) */
+    gboolean drop_shell_accepted; /* shell took the drop (page refused) */
+    GPtrArray *drop_uris;         /* char* URIs from text/uri-list */
+    gchar *drop_text;             /* text from the text targets */
+    guint drop_timer;             /* fallback-delay source id, 0 = none */
+    guint drop_leave_timer;       /* leave-vs-drop resolver id, 0 = none */
+    guint drop_status_timer;      /* COPY re-assert id, 0 = none */
 } Tab;
 
 typedef struct {
@@ -314,6 +340,324 @@ static void navigate_from_entry(Browser *b)
     }
 }
 
+/* ---------- drag & drop ----------
+ *
+ * WebKit registers the web view itself as a drag destination and
+ * connects its own handlers with g_signal_connect_after. On a drag it
+ * pre-loads the data, asks the page whether it accepts, and on drop
+ * delivers the data to the web content and finishes the drag. That is
+ * what lets a page's own drop zone (e.g. Discord's file upload)
+ * receive the dropped files.
+ *
+ * This layer is a shell-level fallback for drops the page refuses:
+ * URLs and files then open in new tabs. These handlers connect with
+ * g_signal_connect (not connect_after), so they run before WebKit's
+ * and can veto the drop by returning TRUE from "drag-drop".
+ *
+ * The decision:
+ *   drag-motion  -> note the drag, arm a short fallback timer
+ *   (async)      -> WebKit's page query answers; an accepted drag
+ *                   becomes a non-zero selected action, a refused one
+ *                   stays zero
+ *   fallback     -> ~250ms later, if the page refused and the data is
+ *                   usable, the shell accepts the drag itself (status
+ *                   COPY) so the cursor shows a valid target, and keeps
+ *                   re-asserting COPY after each motion (WebKit's async
+ *                   "refused" status would otherwise cancel the drag)
+ *   drag-leave   -> GTK emits this both on a real leave and just
+ *                   before drag-drop; a 0ms resolver timer defers the
+ *                   cleanup so a drop is not lost (WebKit does the same)
+ *   drag-drop    -> if the page never accepted and the data is usable,
+ *                   the shell opens the URIs in new tabs, finishes the
+ *                   drag, and vetoes WebKit; otherwise WebKit delivers
+ *                   the drop to the web content
+ *
+ * GDK internals relied on here (gtk+ 3.24):
+ *   - the drag source sends XdndDrop only if its last received
+ *     XdndStatus names a valid action; WebKit re-sends the page's
+ *     decision (asynchronously, after every drag motion), so once the
+ *     shell accepts it must keep re-asserting COPY (drop_status_keep_cb)
+ *     or the source cancels the drag instead of dropping.
+ *   - gtk emits "drag-leave" before "drag-drop" on a drop, so leave
+ *     must not destroy drop state synchronously.
+ *   - gdk_drag_context_list_targets() returns the context's internal
+ *     list and must never be freed, so this code does not call it. */
+
+static gboolean drop_is_text_atom(GdkAtom atom)
+{
+    return atom == atom_text_plain || atom == atom_text_utf8 ||
+           atom == atom_text_string || atom == atom_text_text ||
+           atom == atom_netscape_url;
+}
+
+static void tab_drop_free_data(Tab *tab)
+{
+    if (tab->drop_uris) {
+        g_ptr_array_free(tab->drop_uris, TRUE);
+        tab->drop_uris = NULL;
+    }
+    g_free(tab->drop_text);
+    tab->drop_text = NULL;
+}
+
+/* Reset all pending drop state (timers, data, context ref). */
+static void tab_drop_cancel(Tab *tab)
+{
+    if (tab->drop_timer) {
+        g_source_remove(tab->drop_timer);
+        tab->drop_timer = 0;
+    }
+    if (tab->drop_leave_timer) {
+        g_source_remove(tab->drop_leave_timer);
+        tab->drop_leave_timer = 0;
+    }
+    if (tab->drop_status_timer) {
+        g_source_remove(tab->drop_status_timer);
+        tab->drop_status_timer = 0;
+    }
+    tab->drop_shell_accepted = FALSE;
+    tab_drop_free_data(tab);
+    g_clear_object(&tab->drop_ctx);
+}
+
+/* The tab is being destroyed with a drag pending. */
+static void tab_drop_cleanup(Tab *tab)
+{
+    if (tab->drop_ctx)
+        tab_drop_cancel(tab);
+}
+
+static gboolean drop_data_actionable(Tab *tab)
+{
+    if (tab->drop_uris)
+        for (guint i = 0; i < tab->drop_uris->len; i++) {
+            const char *uri = g_ptr_array_index(tab->drop_uris, i);
+            if (g_str_has_prefix(uri, "file://") ||
+                g_str_has_prefix(uri, "http://") ||
+                g_str_has_prefix(uri, "https://"))
+                return TRUE;
+        }
+    return tab->drop_text != NULL && looks_like_url(tab->drop_text);
+}
+
+static gboolean drop_status_keep_cb(gpointer data);
+
+/* Fires ~250ms after a drag started over the view, once WebKit's async
+ * page query has had a chance to answer. If the page refused (no
+ * selected action) and the data is usable, accept the drop at the shell
+ * level so the cursor shows a valid target. */
+static gboolean drop_fallback_cb(gpointer data)
+{
+    Tab *tab = data;
+    if (!tab->drop_ctx || tab->drop_shell_accepted)
+        return G_SOURCE_REMOVE;
+    if (gdk_drag_context_get_selected_action(tab->drop_ctx) != 0)
+        return G_SOURCE_REMOVE; /* the page accepted: WebKit owns it */
+    if (!drop_data_actionable(tab))
+        return G_SOURCE_REMOVE;
+    gdk_drag_status(tab->drop_ctx, GDK_CURRENT_TIME, GDK_ACTION_COPY);
+    tab->drop_shell_accepted = TRUE;
+    /* keep asserting the status; see drop_status_keep_cb */
+    tab->drop_status_timer = g_timeout_add(DROP_STATUS_KEEP_MS,
+                                           drop_status_keep_cb, tab);
+    return G_SOURCE_REMOVE;
+}
+
+/* WebKit re-sends the page's decision (here: "refused") asynchronously
+ * after every drag motion, and that late status would reach the drag
+ * source before a release, making it cancel the drag (X sends Leave
+ * instead of Drop). Once the shell has accepted, our COPY status must be
+ * the last one the source sees, so re-assert it shortly after the last
+ * motion. Armed by drop_fallback_cb and by on_view_drag_motion. */
+static gboolean drop_status_keep_cb(gpointer data)
+{
+    Tab *tab = data;
+    tab->drop_status_timer = 0;
+    if (tab->drop_ctx && tab->drop_shell_accepted)
+        gdk_drag_status(tab->drop_ctx, GDK_CURRENT_TIME, GDK_ACTION_COPY);
+    return G_SOURCE_REMOVE;
+}
+
+/* 0ms resolver for drag-leave: if this fires, the drag left without a
+ * drop (the pointer left or it was cancelled), so clear the state. On a
+ * real drop, drag-drop runs first and cancels this timer. */
+static gboolean drop_leave_cb(gpointer data)
+{
+    Tab *tab = data;
+    tab->drop_leave_timer = 0;
+    tab_drop_cancel(tab);
+    return G_SOURCE_REMOVE;
+}
+
+/* Open what the shell accepted: file:// and http(s):// URIs and
+ * plain-text URLs, each in a new tab. */
+static void tab_drop_open(Tab *tab)
+{
+    Browser *b = tab->browser;
+    int opened = 0;
+    if (tab->drop_uris) {
+        for (guint i = 0; i < tab->drop_uris->len && opened < DROP_MAX_TABS; i++) {
+            const char *uri = g_ptr_array_index(tab->drop_uris, i);
+            if (g_str_has_prefix(uri, "file://") ||
+                g_str_has_prefix(uri, "http://") ||
+                g_str_has_prefix(uri, "https://")) {
+                new_tab(b, uri);
+                opened++;
+            }
+        }
+    }
+    if (!opened && tab->drop_text) {
+        /* _NETSCAPE_URL payloads are "URL\nname": use the first line */
+        gchar *line = g_strstrip(g_strdup(tab->drop_text));
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        if (looks_like_url(line)) {
+            char *uri = normalize_uri(line);
+            new_tab(b, uri);
+            g_free(uri);
+        }
+        g_free(line);
+    }
+}
+
+static gboolean on_view_drag_motion(GtkWidget *w, GdkDragContext *ctx, gint x,
+                                    gint y, guint time, Tab *tab)
+{
+    (void)w; (void)x; (void)y; (void)time;
+    if (tab->drop_ctx != ctx) {
+        tab_drop_cancel(tab);
+        tab->drop_ctx = g_object_ref(ctx);
+        tab->drop_timer = g_timeout_add(DROP_SHELL_DELAY_MS, drop_fallback_cb, tab);
+    } else if (tab->drop_shell_accepted) {
+        /* WebKit's connect-after handler re-queries the page for this
+         * motion and will re-send the "refused" status; re-arm the
+         * re-assert so our COPY is the status the source last sees. */
+        if (!tab->drop_status_timer)
+            tab->drop_status_timer = g_timeout_add(DROP_STATUS_KEEP_MS,
+                                                   drop_status_keep_cb, tab);
+    }
+    return FALSE;
+}
+
+static void on_view_drag_leave(GtkWidget *w, GdkDragContext *ctx, guint time, Tab *tab)
+{
+    (void)w; (void)time;
+    /* GTK emits drag-leave on a drop too (before drag-drop), so defer
+     * the cleanup to a 0ms timer; drag-drop cancels it when a drop
+     * actually happens. */
+    if (tab->drop_ctx == ctx && !tab->drop_leave_timer)
+        tab->drop_leave_timer = g_timeout_add(0, drop_leave_cb, tab);
+}
+
+/* WebKit pre-loads the drag data for its supported targets; it arrives
+ * on this signal. Collect it (WebKit's connect-after handler gets it
+ * too). */
+static gboolean on_view_drag_data_received(GtkWidget *w, GdkDragContext *ctx, gint x,
+                                           gint y, GtkSelectionData *sd, guint info,
+                                           guint time, Tab *tab)
+{
+    (void)w; (void)x; (void)y; (void)info; (void)time;
+    if (tab->drop_ctx != ctx || !sd)
+        return FALSE;
+    if (gtk_selection_data_get_target(sd) == atom_text_uri_list) {
+        gchar **uris = gtk_selection_data_get_uris(sd);
+        if (uris) {
+            if (!tab->drop_uris)
+                tab->drop_uris = g_ptr_array_new();
+            for (int i = 0; uris[i]; i++)
+                g_ptr_array_add(tab->drop_uris, g_strdup(uris[i]));
+            g_free(uris);
+        }
+    } else if (drop_is_text_atom(gtk_selection_data_get_target(sd))) {
+        gchar *text = (gchar *)gtk_selection_data_get_text(sd);
+        if (text) {
+            g_free(tab->drop_text);
+            tab->drop_text = g_strdup(text);
+            g_free(text);
+        }
+    }
+    return FALSE;
+}
+
+static gboolean on_view_drag_drop(GtkWidget *w, GdkDragContext *ctx, gint x,
+                                  gint y, guint time, Tab *tab)
+{
+    (void)w; (void)x; (void)y;
+    if (tab->drop_ctx != ctx)
+        return FALSE;
+    /* A drop is happening: the pending drag-leave was the pre-drop one. */
+    if (tab->drop_leave_timer) {
+        g_source_remove(tab->drop_leave_timer);
+        tab->drop_leave_timer = 0;
+    }
+
+    /* The page accepted it (WebKit set a selected action) unless the
+     * shell already accepted in the fallback. */
+    gboolean page_accepted =
+        (gdk_drag_context_get_selected_action(ctx) != 0) && !tab->drop_shell_accepted;
+    if (page_accepted)
+        return FALSE; /* the page wants it: WebKit delivers to the content */
+    if (!drop_data_actionable(tab))
+        return FALSE; /* nothing the shell can do with it */
+
+    /* The shell takes this drop (page refused, or a fast drop before the
+     * fallback timer fired): open the URIs, finish the drag, and veto
+     * WebKit's own finish so the drop is handled exactly once. */
+    tab_drop_open(tab);
+    gtk_drag_finish(ctx, TRUE, FALSE, time);
+    tab_drop_cancel(tab);
+    return TRUE;
+}
+
+/* Drop target on the window chrome (toolbar, tab strip): the web view
+ * is the innermost destination, so this only fires for drops outside
+ * it. */
+static const GtkTargetEntry WINDOW_DROP_TARGETS[] = {
+    { (gchar *)"text/uri-list", 0, 1 },
+    { (gchar *)"text/plain", 0, 2 },
+    { (gchar *)"text/html", 0, 3 },
+};
+
+static gboolean on_window_drag_data_received(GtkWidget *w, GdkDragContext *ctx, gint x,
+                                             gint y, GtkSelectionData *sd, guint info,
+                                             guint time, Browser *b)
+{
+    (void)w; (void)ctx; (void)x; (void)y; (void)info; (void)time;
+    if (!sd)
+        return TRUE;
+    int opened = 0;
+    if (gtk_selection_data_get_target(sd) == atom_text_uri_list) {
+        gchar **uris = gtk_selection_data_get_uris(sd);
+        if (uris) {
+            for (int i = 0; uris[i] && opened < DROP_MAX_TABS; i++) {
+                if (g_str_has_prefix(uris[i], "file://") ||
+                    g_str_has_prefix(uris[i], "http://") ||
+                    g_str_has_prefix(uris[i], "https://")) {
+                    new_tab(b, uris[i]);
+                    opened++;
+                }
+            }
+            g_free(uris);
+        }
+    } else if (drop_is_text_atom(gtk_selection_data_get_target(sd))) {
+        gchar *text = (gchar *)gtk_selection_data_get_text(sd);
+        if (text) {
+            gchar *line = g_strstrip(text);
+            char *nl = strchr(line, '\n');
+            if (nl)
+                *nl = '\0';
+            if (looks_like_url(line)) {
+                char *uri = normalize_uri(line);
+                new_tab(b, uri);
+                g_free(uri);
+            }
+            g_free(text);
+        }
+    }
+    return TRUE;
+}
+
 /* ---------- tabs ---------- */
 
 static void close_tab(Browser *b, GtkWidget *page)
@@ -321,6 +665,7 @@ static void close_tab(Browser *b, GtkWidget *page)
     GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
     Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
     if (tab) {
+        tab_drop_cleanup(tab);
         drop_source_file(tab, NULL);
         if (tab == b->find_tab) {
             webkit_find_controller_search_finish(
@@ -552,6 +897,12 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     g_signal_connect(view, "notify::loading", G_CALLBACK(on_notify_loading), tab);
     g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(on_notify_progress), tab);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), tab);
+    /* shell-level drop fallback; runs before WebKit's own handlers, so
+     * a drop the web page refused can be opened here as new tabs */
+    g_signal_connect(view, "drag-motion", G_CALLBACK(on_view_drag_motion), tab);
+    g_signal_connect(view, "drag-leave", G_CALLBACK(on_view_drag_leave), tab);
+    g_signal_connect(view, "drag-data-received", G_CALLBACK(on_view_drag_data_received), tab);
+    g_signal_connect(view, "drag-drop", G_CALLBACK(on_view_drag_drop), tab);
     g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(on_tab_close_clicked), page);
     g_signal_connect(label_box, "button-press-event", G_CALLBACK(on_tab_button_press), page);
 
@@ -2715,6 +3066,13 @@ int main(int argc, char *argv[])
     /* ---- no running instance: start the browser ---- */
     gtk_init(&argc, &argv);
 
+    atom_text_uri_list  = gdk_atom_intern("text/uri-list", FALSE);
+    atom_text_plain     = gdk_atom_intern("text/plain", FALSE);
+    atom_text_utf8      = gdk_atom_intern("UTF8_STRING", FALSE);
+    atom_text_string    = gdk_atom_intern("STRING", FALSE);
+    atom_text_text      = gdk_atom_intern("TEXT", FALSE);
+    atom_text_html      = gdk_atom_intern("text/html", FALSE);
+    atom_netscape_url   = gdk_atom_intern("_NETSCAPE_URL", FALSE);
     /* Force the software renderer. When the GPU/DMABUF renderer cannot get
      * permission to create GPU buffers (VMs, containers, headless setups),
      * WebKit leaves the page blank; software rendering always works. */
@@ -2740,6 +3098,13 @@ int main(int argc, char *argv[])
     gtk_window_set_default_size(GTK_WINDOW(b->window), 1100, 700);
     g_signal_connect(b->window, "destroy", G_CALLBACK(on_destroy), b);
     g_signal_connect(b->window, "key-press-event", G_CALLBACK(on_key_press), b);
+    /* drops on the toolbar / tab strip open the link or file in a new
+     * tab; drops on the web view are handled by the per-view fallback */
+    gtk_drag_dest_set(b->window, GTK_DEST_DEFAULT_ALL,
+                      WINDOW_DROP_TARGETS, G_N_ELEMENTS(WINDOW_DROP_TARGETS),
+                      GDK_ACTION_COPY);
+    g_signal_connect(b->window, "drag-data-received",
+                     G_CALLBACK(on_window_drag_data_received), b);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(b->window), vbox);
