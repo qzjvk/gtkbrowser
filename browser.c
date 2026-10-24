@@ -2860,7 +2860,6 @@ int main(int argc, char *argv[])
     gtk_box_pack_start(GTK_BOX(b->find_bar), find_next_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(b->find_bar), find_close_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), b->find_bar, FALSE, FALSE, 0);
-    gtk_widget_set_no_show_all(b->find_bar, TRUE);
 
     g_signal_connect(b->back_button, "clicked", G_CALLBACK(on_back_clicked), b);
     g_signal_connect(b->forward_button, "clicked", G_CALLBACK(on_forward_clicked), b);
@@ -2902,6 +2901,7 @@ int main(int argc, char *argv[])
     g_timeout_add(1000, update_blocked_label, b);
 
     gtk_widget_show_all(b->window);
+    gtk_widget_hide(b->find_bar);
     gtk_main();
     return 0;
 }
