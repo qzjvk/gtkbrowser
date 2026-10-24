@@ -811,6 +811,11 @@ static void update_tabbar(Win *win)
     GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
     int n = gtk_notebook_get_n_pages(nb);
     gboolean show = (n >= 2) || !win->browser->hide_tabbar;
+    GtkStyleContext *sctx = gtk_widget_get_style_context(win->notebook);
+    if (show)
+        gtk_style_context_remove_class(sctx, "single-tab");
+    else
+        gtk_style_context_add_class(sctx, "single-tab");
     for (int i = 0; i < n; i++) {
         GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
         Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
@@ -3365,9 +3370,9 @@ static Win *new_window(Browser *b)
     gtk_box_pack_start(GTK_BOX(win->find_bar), find_close_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), win->find_bar, FALSE, FALSE, 0);
 
-    /* 0x0 stand-in tab label that hides the whole tab strip (single tab) */
-    win->empty_tab_label = gtk_label_new("");
-    gtk_widget_set_size_request(win->empty_tab_label, 0, 0);
+    /* 0x0 stand-in tab label that hides the whole tab strip (single tab);
+     * an empty box has 0 natural size, so the tab area collapses to 0 */
+    win->empty_tab_label = g_object_ref_sink(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
 
     g_signal_connect(win->back_button, "clicked", G_CALLBACK(on_back_clicked), win);
     g_signal_connect(win->forward_button, "clicked", G_CALLBACK(on_forward_clicked), win);
@@ -3413,6 +3418,22 @@ static void apply_css(void)
         "  box-shadow: none;"
         "  background-image: none;"
         "  background-color: @theme_selected_bg_color;"
+        "}"
+        "notebook.single-tab header,"
+        "notebook.single-tab tabs,"
+        "notebook.single-tab tab {"
+        "  min-height: 0;"
+        "  min-width: 0;"
+        "  padding: 0;"
+        "  margin: 0;"
+        "  border-width: 0;"
+        "  border: none;"
+        "  box-shadow: none;"
+        "  background: none;"
+        "}"
+        "notebook.single-tab header tab > * {"
+        "  min-height: 0;"
+        "  min-width: 0;"
         "}";
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
