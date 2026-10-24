@@ -30,8 +30,8 @@ Installs:
 ## Features
 
 - Tabs: `Ctrl+T` new, `Ctrl+W` close, double-click or middle-click a tab to
-  close it, tabs are reorderable, `Ctrl+1`…`Ctrl+9` jump to a tab,
-  `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle, `Ctrl+Shift+T` reopens the most
+  close it, tabs are reorderable, `Ctrl+1`…`Ctrl+9` or `Alt+1`…`Alt+0` jump to
+  a tab, `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle, `Ctrl+Shift+T` reopens the most
   recently closed tab
 - Windows: right-click a tab → "Move to New Window" splits it into its own
   window (the page and its state are kept — no reload); the app quits when
@@ -45,6 +45,10 @@ Installs:
 - Find in page: `Ctrl+F` — Enter next match, Shift+Enter previous, Esc close;
   shows an `N/M` match counter
 - Page source: `Ctrl+U`; save page: `Ctrl+S`
+- Page context menu: right-click a page → open a link / image / media in a new
+  tab or window, copy its address, cut / copy / paste / select-all in a form
+  field, copy or search selected text, view source, save page, or reload
+  (replaces WebKit's default menu)
 - Fullscreen: `F11`
 - Zoom: `Ctrl+=` / `Ctrl+-` / `Ctrl+0`; default zoom for new tabs in Settings
 - Home: `Ctrl+H`, reload: `F5` / `Ctrl+R`

@@ -186,6 +186,9 @@ static void on_blocklist_browse(GtkButton *btn, Browser *b);
 static GtkWidget *find_named(GtkWidget *w, const char *name);
 static void save_settings(Browser *b);
 static void drop_source_file(Tab *tab, const char *uri);
+static gboolean on_view_context_menu(WebKitWebView *view, GtkWidget *menu,
+                                     GdkEvent *event, WebKitHitTestResult *hit,
+                                     gpointer user_data);
 static void find_open(Win *win);
 static void find_close(Win *win);
 static void on_find_found_text(GtkWidget *controller, guint pos, Win *win);
@@ -1029,6 +1032,7 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     g_signal_connect(view, "notify::loading", G_CALLBACK(on_notify_loading), tab);
     g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(on_notify_progress), tab);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), tab);
+    g_signal_connect(view, "context-menu", G_CALLBACK(on_view_context_menu), tab);
     /* shell-level drop fallback; runs before WebKit's own handlers, so
      * a drop the web page refused can be opened here as new tabs */
     g_signal_connect(view, "drag-motion", G_CALLBACK(on_view_drag_motion), tab);
@@ -2832,6 +2836,180 @@ static void drop_source_file(Tab *tab, const char *uri)
     tab->source_file = NULL;
 }
 
+/* ---------- page context menu ----------
+ *
+ * WebKit hands the ::context-menu handler its default menu; we suppress it
+ * (returning TRUE) and show our own, combining the page's copy/edit with the
+ * browser's actions. The hit-test context says what was right-clicked. */
+
+/* labelled item wired to cb(item, user_data) */
+static void ctx_add(GtkWidget *menu, const char *label,
+                    GCallback cb, gpointer user_data)
+{
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    if (cb)
+        g_signal_connect(item, "activate", cb, user_data);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static void ctx_sep(GtkWidget *menu)
+{
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+}
+
+/* item whose attached URI is opened/copied via open_cb(item, user_data) */
+static void ctx_uri(GtkWidget *menu, const char *label, const char *uri,
+                    Tab *tab, GCallback open_cb)
+{
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_object_set_data_full(G_OBJECT(item), "uri", g_strdup(uri), g_free);
+    g_signal_connect(item, "activate", open_cb, tab);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+/* item that runs document.execCommand(attach) on the page */
+static void ctx_exec(GtkMenuItem *item, gpointer user_data)
+{
+    Tab *tab = user_data;
+    const char *cmd = g_object_get_data(G_OBJECT(item), "cmd");
+    char *js = g_strdup_printf("document.execCommand('%s')", cmd);
+    webkit_web_view_evaluate_javascript(tab->view, js, -1, NULL, NULL, NULL,
+                                        NULL, NULL);
+    g_free(js);
+}
+
+static void ctx_exec_item(GtkWidget *menu, const char *label, Tab *tab,
+                          const char *cmd)
+{
+    GtkWidget *item = gtk_menu_item_new_with_label(label);
+    g_object_set_data_full(G_OBJECT(item), "cmd", g_strdup(cmd), g_free);
+    g_signal_connect(item, "activate", G_CALLBACK(ctx_exec), tab);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+static void ctx_open_tab(GtkMenuItem *item, gpointer user_data)
+{
+    Tab *tab = user_data;
+    const char *uri = g_object_get_data(G_OBJECT(item), "uri");
+    if (uri)
+        new_tab(tab->win, uri);
+}
+
+static void ctx_open_window(GtkMenuItem *item, gpointer user_data)
+{
+    Tab *tab = user_data;
+    const char *uri = g_object_get_data(G_OBJECT(item), "uri");
+    if (uri)
+        new_tab(new_window(tab->win->browser), uri);
+}
+
+static void ctx_copy_uri(GtkMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    const char *uri = g_object_get_data(G_OBJECT(item), "uri");
+    if (!uri)
+        return;
+    GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clip, uri, -1);
+}
+
+/* fetch the selection, search it in a new tab */
+static void ctx_search_done(GObject *src, GAsyncResult *res, gpointer user_data)
+{
+    Tab *tab = user_data;
+    JSCValue *val = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(src), res, NULL);
+    char *sel = val ? jsc_value_to_string(val) : NULL;
+    if (sel && *sel) {
+        char *q = g_uri_escape_string(sel, NULL, TRUE);
+        char *url = build_search_url(search_template(tab->win->browser), q);
+        new_tab(tab->win, url);
+        g_free(url);
+        g_free(q);
+    }
+    g_free(sel);
+}
+
+static void ctx_search(GtkMenuItem *item, gpointer user_data)
+{
+    (void)item;
+    Tab *tab = user_data;
+    webkit_web_view_evaluate_javascript(tab->view, "window.getSelection().toString()",
+                                        -1, NULL, NULL, NULL, ctx_search_done, tab);
+}
+
+static void ctx_view_source(GtkMenuItem *item, gpointer user_data)
+{
+    (void)item;
+    Tab *tab = user_data;
+    view_source_current(tab->view, tab);
+}
+
+static void ctx_save_page(GtkMenuItem *item, gpointer user_data)
+{
+    (void)item;
+    Tab *tab = user_data;
+    save_page_current(tab->view, tab);
+}
+
+static void ctx_reload(GtkMenuItem *item, gpointer user_data)
+{
+    (void)item;
+    Tab *tab = user_data;
+    webkit_web_view_reload(tab->view);
+}
+
+static gboolean on_view_context_menu(WebKitWebView *view, GtkWidget *menu,
+                                     GdkEvent *event, WebKitHitTestResult *hit,
+                                     gpointer user_data)
+{
+    (void)view;
+    (void)menu; /* WebKit's default menu is unused; we build our own */
+    Tab *tab = user_data;
+    const char *link = webkit_hit_test_result_get_link_uri(hit);
+    const char *image = webkit_hit_test_result_get_image_uri(hit);
+    const char *media = webkit_hit_test_result_get_media_uri(hit);
+    gboolean editable = webkit_hit_test_result_context_is_editable(hit);
+    gboolean selection = webkit_hit_test_result_context_is_selection(hit);
+
+    GtkWidget *m = gtk_menu_new();
+    if (link) {
+        ctx_uri(m, "Open in New Tab", link, tab, G_CALLBACK(ctx_open_tab));
+        ctx_uri(m, "Open in New Window", link, tab, G_CALLBACK(ctx_open_window));
+        ctx_uri(m, "Copy Link Address", link, tab, G_CALLBACK(ctx_copy_uri));
+        ctx_sep(m);
+    }
+    if (image) {
+        ctx_uri(m, "Open Image in New Tab", image, tab, G_CALLBACK(ctx_open_tab));
+        ctx_uri(m, "Copy Image Address", image, tab, G_CALLBACK(ctx_copy_uri));
+        ctx_sep(m);
+    }
+    if (media) {
+        ctx_uri(m, "Open Media in New Tab", media, tab, G_CALLBACK(ctx_open_tab));
+        ctx_uri(m, "Copy Media Address", media, tab, G_CALLBACK(ctx_copy_uri));
+        ctx_sep(m);
+    }
+    if (editable) {
+        ctx_exec_item(m, "Cut", tab, "cut");
+        ctx_exec_item(m, "Copy", tab, "copy");
+        ctx_exec_item(m, "Paste", tab, "paste");
+        ctx_exec_item(m, "Select All", tab, "selectAll");
+        ctx_sep(m);
+    }
+    if (selection) {
+        ctx_exec_item(m, "Copy", tab, "copy");
+        ctx_add(m, "Search for This", G_CALLBACK(ctx_search), tab);
+        ctx_sep(m);
+    }
+    ctx_add(m, "View Page Source", G_CALLBACK(ctx_view_source), tab);
+    ctx_add(m, "Save Page As...", G_CALLBACK(ctx_save_page), tab);
+    ctx_add(m, "Reload", G_CALLBACK(ctx_reload), tab);
+
+    gtk_widget_show_all(m);
+    gtk_menu_popup_at_pointer(GTK_MENU(m), (GdkEvent *)event);
+    return TRUE; /* suppress WebKit's default menu */
+}
+
 /* ---------- keyboard shortcuts ---------- */
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
@@ -2885,6 +3063,16 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
         }
         if (keyval == GDK_KEY_Right && webkit_web_view_can_go_forward(tab->view)) {
             webkit_web_view_go_forward(tab->view);
+            return TRUE;
+        }
+        /* Alt+1..0 jump to a tab (Alt+0 -> first). */
+        if (keyval == GDK_KEY_0 ||
+            (keyval >= GDK_KEY_1 && keyval <= GDK_KEY_9)) {
+            GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+            int n = gtk_notebook_get_n_pages(nb);
+            int idx = (keyval == GDK_KEY_0) ? 0 : (keyval - GDK_KEY_1);
+            if (n > 0)
+                gtk_notebook_set_current_page(nb, MIN(idx, n - 1));
             return TRUE;
         }
         return FALSE;
