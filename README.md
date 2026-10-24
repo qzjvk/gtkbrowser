@@ -29,14 +29,33 @@ Installs:
 
 ## Features
 
-- Tabs: `Ctrl+T` new, `Ctrl+W` close, double-click a tab to close it, tabs are reorderable
-- Back / forward / reload-stop buttons with a load progress bar
-- URL bar with search fallback (DuckDuckGo) — `Ctrl+L` to focus
-- Favicon in the tab label and window title
+- Tabs: `Ctrl+T` new, `Ctrl+W` close, double-click or middle-click a tab to
+  close it, tabs are reorderable, `Ctrl+1`…`Ctrl+9` jump to a tab,
+  `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle, `Ctrl+Shift+T` reopens the most
+  recently closed tab
+- Back / forward / reload-stop buttons with a thin load progress bar;
+  `Alt+Left` / `Alt+Right` navigate back / forward
+- URL bar with search fallback and history/bookmark autocomplete — `Ctrl+L`
+  to focus; search engine is selectable in Settings (incl. a custom engine)
+- Padlock in the URL bar: green for HTTPS, red for plain HTTP
+- Find in page: `Ctrl+F` — Enter next match, Shift+Enter previous, Esc close;
+  shows an `N/M` match counter
+- Page source: `Ctrl+U`; save page: `Ctrl+S`
+- Fullscreen: `F11`
+- Zoom: `Ctrl+=` / `Ctrl+-` / `Ctrl+0`; default zoom for new tabs in Settings
+- Home: `Ctrl+H`, reload: `F5` / `Ctrl+R`
+- History and bookmarks: `Ctrl+D` toggles the current page; the star button
+  opens a bookmark panel (double-click a row to open it); Settings →
+  "Manage history and bookmarks" lets you open, delete, or clear entries
+- Session restore: previous session's tabs are reopened at start
+  (toggleable in Settings)
+- Ad blocking (uBlock-like) via a local proxy, with a live blocked-request
+  counter in the toolbar; toggle and custom blocklist in Settings
+- KeePass autofill: `Ctrl+Shift+L` fills the current page's login via
+  `keepassxc-cli`; database chosen in Settings
 - `window.open()` and `target="_blank"` links open in new tabs
 - Downloads prompt a save-file dialog
-- Zoom: `Ctrl+=` / `Ctrl+-` / `Ctrl+0`
-- Home: `Ctrl+H`, reload: `F5` / `Ctrl+R`
+- New tab page and custom user agent configurable in Settings
 
 ## Notes
 
