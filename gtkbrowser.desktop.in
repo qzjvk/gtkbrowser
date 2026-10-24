@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=GtkBrowser
-Comment=A minimal GTK3 + WebKitGTK browser with drag & drop support
+Comment=A minimal GTK3 + WebKitGTK browser with multiple windows and drag & drop
 Exec=@bindir@/gtkbrowser %u
 Icon=web-browser
 Terminal=false

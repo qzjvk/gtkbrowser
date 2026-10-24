@@ -70,8 +70,37 @@ static GdkAtom atom_netscape_url;
 #define DROP_MAX_TABS 8
 
 typedef struct Tab Tab;
+typedef struct Browser Browser;
+typedef struct Win Win;
 
-typedef struct {
+/* App-level state, one per process: shared across every window. */
+struct Browser {
+    GPtrArray *windows;      /* Win*, most recent last */
+    Win *active;             /* window with keyboard focus, or NULL */
+    AdbProxy *proxy;
+    gboolean adblock_enabled;
+    gboolean devtools_enabled;
+    gchar *blocklist_file;
+    gchar *kp_db_path;   /* configured .kdbx path (persisted) */
+    gchar *kp_password;  /* session cache of the db password */
+    GSocketService *control_service;
+    gchar *control_socket_path;
+    GPtrArray *history;      /* char* URIs, most recent first */
+    GPtrArray *bookmarks;    /* Bookmark* */
+    GtkListStore *url_model; /* autocomplete suggestions */
+    int search_engine;       /* index into SEARCH_ENGINES */
+    gchar *custom_search_base; /* "Custom" engine URL template */
+    gchar *home_url;         /* Ctrl+H target (settings) */
+    gchar *new_tab_url;      /* page for new tabs (settings) */
+    int default_zoom;        /* percent, applied to new tabs */
+    gchar *user_agent;       /* custom user agent (settings) */
+    GPtrArray *closed_tabs;  /* most-recent-closed first (Ctrl+Shift+T) */
+    gboolean restore_session; /* reopen last session's tabs at start */
+    gboolean hide_tabbar;    /* hide the tab strip in single-tab windows */
+};
+
+/* Per-window state: the toplevel and everything that lives inside it. */
+struct Win {
     GtkWidget *window;
     GtkWidget *notebook;
     GtkWidget *url_entry;
@@ -81,41 +110,25 @@ typedef struct {
     GtkWidget *progress;
     GtkWidget *blocked_button;
     GtkWidget *blocked_label;
-    AdbProxy *proxy;
-    gboolean adblock_enabled;
-    gboolean devtools_enabled;
-    gchar *blocklist_file;
     GtkWidget *kp_fill_button;
-    gchar *kp_db_path;   /* configured .kdbx path (persisted) */
-    gchar *kp_password;  /* session cache of the db password */
-    GSocketService *control_service;
-    gchar *control_socket_path;
-    GPtrArray *history;      /* char* URIs, most recent first */
-    GPtrArray *bookmarks;    /* Bookmark* */
     GtkWidget *bookmarks_button;
-    GtkListStore *url_model; /* autocomplete suggestions */
-    int search_engine;       /* index into SEARCH_ENGINES */
-    gchar *custom_search_base; /* "Custom" engine URL template */
-    gchar *home_url;         /* Ctrl+H target (settings) */
-    gchar *new_tab_url;      /* page for new tabs (settings) */
-    int default_zoom;        /* percent, applied to new tabs */
-    gchar *user_agent;       /* custom user agent (settings) */
     Tab *find_tab;           /* tab whose find controller is active */
     GtkWidget *find_bar;     /* Ctrl+F bar, hidden by default */
     GtkWidget *find_entry;
     GtkWidget *find_label;   /* "N/M" match label */
     guint find_pos;
     guint find_count;
-    GPtrArray *closed_tabs;  /* most-recent-closed first (Ctrl+Shift+T) */
-    gboolean restore_session; /* reopen last session's tabs at start */
     gboolean fullscreen;     /* F11 state */
-} Browser;
+    GtkWidget *empty_tab_label; /* 0x0 label that hides the tab strip */
+    Browser *browser;        /* app back-pointer */
+};
 
 typedef struct Tab {
-    Browser *browser;
+    Win *win;                /* window the tab lives in */
     WebKitWebView *view;
     GtkWidget *icon_image;
     GtkWidget *title_label;
+    GtkWidget *tab_label;    /* the tab's label box (icon + title + close) */
     gchar *source_file;      /* temp file behind a Ctrl+U view-source load */
     /* pending drag & drop state; see the "drag & drop" section */
     GdkDragContext *drop_ctx;     /* drag currently over the view (ref) */
@@ -138,11 +151,20 @@ typedef struct {
 } ClosedTab;
 
 /* forward declarations */
-static GtkWidget *new_tab(Browser *b, const char *uri);
-static void close_tab(Browser *b, GtkWidget *page);
-static void update_url_entry(Browser *b, Tab *tab);
-static void update_nav_buttons(Browser *b, Tab *tab);
-static void update_window_title(Browser *b, Tab *tab);
+static Win *new_window(Browser *b);
+static void close_window(Win *win);
+static void on_window_destroy(GtkWidget *w, Win *win);
+static void on_window_focus_in(GtkWidget *w, GdkEvent *e, Win *win);
+static Win *active_window(Browser *b);
+static GtkWidget *win_toplevel(Browser *b);
+static void detach_tab(Win *win, GtkWidget *page);
+static void update_tabbar(Win *win);
+static void tab_destroy(Tab *tab);
+static GtkWidget *new_tab(Win *win, const char *uri);
+static void close_tab(Win *win, GtkWidget *page);
+static void update_url_entry(Win *win, Tab *tab);
+static void update_nav_buttons(Win *win, Tab *tab);
+static void update_window_title(Win *win, Tab *tab);
 static char *normalize_uri(const char *s);
 static void set_adblock_enabled(Browser *b, gboolean enabled);
 static gboolean update_blocked_label(gpointer data);
@@ -153,7 +175,7 @@ static void on_blocked_clicked(GtkButton *btn, Browser *b);
 static void history_add(Browser *b, const char *uri);
 static void refresh_url_model(Browser *b);
 static void bookmark_toggle(Browser *b, const char *uri, const char *title);
-static void cycle_tab(Browser *b, int delta);
+static void cycle_tab(Win *win, int delta);
 static void on_engine_changed(GtkComboBox *combo, Browser *b);
 static void on_custom_search_changed(GtkEntry *entry, Browser *b);
 static void on_home_changed(GtkEntry *entry, Browser *b);
@@ -164,28 +186,29 @@ static void on_blocklist_browse(GtkButton *btn, Browser *b);
 static GtkWidget *find_named(GtkWidget *w, const char *name);
 static void save_settings(Browser *b);
 static void drop_source_file(Tab *tab, const char *uri);
-static void find_open(Browser *b);
-static void find_close(Browser *b);
-static void on_find_found_text(GtkWidget *controller, guint pos, Browser *b);
-static void on_find_counted_matches(GtkWidget *controller, guint count, Browser *b);
-static void on_find_failed(GtkWidget *controller, Browser *b);
-static void on_find_changed(GtkEntry *entry, Browser *b);
-static void on_find_next_clicked(GtkButton *btn, Browser *b);
-static void on_find_prev_clicked(GtkButton *btn, Browser *b);
-static void on_find_close_clicked(GtkButton *btn, Browser *b);
-static gboolean on_find_key_press(GtkWidget *w, GdkEventKey *e, Browser *b);
+static void find_open(Win *win);
+static void find_close(Win *win);
+static void on_find_found_text(GtkWidget *controller, guint pos, Win *win);
+static void on_find_counted_matches(GtkWidget *controller, guint count, Win *win);
+static void on_find_failed(GtkWidget *controller, Win *win);
+static void on_find_changed(GtkEntry *entry, Win *win);
+static void on_find_next_clicked(GtkButton *btn, Win *win);
+static void on_find_prev_clicked(GtkButton *btn, Win *win);
+static void on_find_close_clicked(GtkButton *btn, Win *win);
+static gboolean on_find_key_press(GtkWidget *w, GdkEventKey *e, Win *win);
 static void on_restore_toggled(GtkToggleButton *btn, Browser *b);
+static void on_hide_tabbar_toggled(GtkToggleButton *btn, Browser *b);
 static void on_manage_history_clicked(GtkButton *btn, Browser *b);
 static void history_save(Browser *b);
 static void bookmarks_save(Browser *b);
 static void session_save(Browser *b);
-static gboolean session_restore(Browser *b);
+static gboolean session_restore(Browser *b, Win *win);
 
 /* ---------- helpers ---------- */
 
-static Tab *current_tab(Browser *b)
+static Tab *current_tab(Win *win)
 {
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
     GtkWidget *page = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
     return page ? g_object_get_data(G_OBJECT(page), "tab") : NULL;
 }
@@ -221,7 +244,7 @@ static gboolean looks_like_url(const char *s)
 
 /* Padlock in the URL bar: green for HTTPS, red for plain HTTP. This
  * WebKit build has no TLS-status API, so the scheme is the indicator. */
-static void update_security_icon(Browser *b, const char *uri)
+static void update_security_icon(Win *win, const char *uri)
 {
     const char *icon = NULL;
     const char *tip = NULL;
@@ -232,17 +255,17 @@ static void update_security_icon(Browser *b, const char *uri)
         icon = "security-low";
         tip = "Insecure connection (HTTP)";
     }
-    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(b->url_entry), GTK_ENTRY_ICON_PRIMARY, icon);
-    gtk_entry_set_icon_tooltip_text(GTK_ENTRY(b->url_entry), GTK_ENTRY_ICON_PRIMARY, tip);
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(win->url_entry), GTK_ENTRY_ICON_PRIMARY, icon);
+    gtk_entry_set_icon_tooltip_text(GTK_ENTRY(win->url_entry), GTK_ENTRY_ICON_PRIMARY, tip);
 }
 
-static void update_url_entry(Browser *b, Tab *tab)
+static void update_url_entry(Win *win, Tab *tab)
 {
     if (!tab)
         return;
     const char *uri = webkit_web_view_get_uri(tab->view);
-    gtk_entry_set_text(GTK_ENTRY(b->url_entry), uri ? uri : "");
-    update_security_icon(b, uri);
+    gtk_entry_set_text(GTK_ENTRY(win->url_entry), uri ? uri : "");
+    update_security_icon(win, uri);
 }
 
 /* Cap the visible tab title at TAB_LABEL_MAX_CHARS (the tooltip keeps the
@@ -260,36 +283,36 @@ static char *truncate_tab_title(const char *s)
     return out;
 }
 
-static void update_nav_buttons(Browser *b, Tab *tab)
+static void update_nav_buttons(Win *win, Tab *tab)
 {
     if (!tab)
         return;
-    gtk_widget_set_sensitive(b->back_button, webkit_web_view_can_go_back(tab->view));
-    gtk_widget_set_sensitive(b->forward_button, webkit_web_view_can_go_forward(tab->view));
+    gtk_widget_set_sensitive(win->back_button, webkit_web_view_can_go_back(tab->view));
+    gtk_widget_set_sensitive(win->forward_button, webkit_web_view_can_go_forward(tab->view));
     const char *icon = webkit_web_view_is_loading(tab->view) ? "process-stop" : "view-refresh";
-    gtk_button_set_image(GTK_BUTTON(b->reload_button),
+    gtk_button_set_image(GTK_BUTTON(win->reload_button),
                          gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_LARGE_TOOLBAR));
 }
 
-static void update_window_title(Browser *b, Tab *tab)
+static void update_window_title(Win *win, Tab *tab)
 {
     if (!tab) {
-        gtk_window_set_title(GTK_WINDOW(b->window), APP_NAME);
+        gtk_window_set_title(GTK_WINDOW(win->window), APP_NAME);
         return;
     }
     const char *title = webkit_web_view_get_title(tab->view);
     if (title && *title) {
         char *t = g_strdup_printf("%s — %s", title, APP_NAME);
-        gtk_window_set_title(GTK_WINDOW(b->window), t);
+        gtk_window_set_title(GTK_WINDOW(win->window), t);
         g_free(t);
     } else {
-        gtk_window_set_title(GTK_WINDOW(b->window), APP_NAME);
+        gtk_window_set_title(GTK_WINDOW(win->window), APP_NAME);
     }
 }
 
-static void load_uri(Browser *b, const char *uri)
+static void load_uri(Win *win, const char *uri)
 {
-    Tab *tab = current_tab(b);
+    Tab *tab = current_tab(win);
     if (tab)
         webkit_web_view_load_uri(tab->view, uri);
 }
@@ -322,20 +345,20 @@ static char *build_search_url(const char *tmpl, const char *escaped_query)
     return g_strdup_printf("%s%s", tmpl, escaped_query);
 }
 
-static void navigate_from_entry(Browser *b)
+static void navigate_from_entry(Win *win)
 {
-    const char *text = gtk_entry_get_text(GTK_ENTRY(b->url_entry));
+    const char *text = gtk_entry_get_text(GTK_ENTRY(win->url_entry));
     if (!text || !*text)
         return;
     if (looks_like_url(text)) {
         char *uri = normalize_uri(text);
-        load_uri(b, uri);
+        load_uri(win, uri);
         g_free(uri);
     } else {
         char *q = g_uri_escape_string(text, NULL, TRUE);
-        char *url = build_search_url(search_template(b), q);
+        char *url = build_search_url(search_template(win->browser), q);
         g_free(q);
-        load_uri(b, url);
+        load_uri(win, url);
         g_free(url);
     }
 }
@@ -493,7 +516,7 @@ static gboolean drop_leave_cb(gpointer data)
  * plain-text URLs, each in a new tab. */
 static void tab_drop_open(Tab *tab)
 {
-    Browser *b = tab->browser;
+    Win *win = tab->win;
     int opened = 0;
     if (tab->drop_uris) {
         for (guint i = 0; i < tab->drop_uris->len && opened < DROP_MAX_TABS; i++) {
@@ -501,7 +524,7 @@ static void tab_drop_open(Tab *tab)
             if (g_str_has_prefix(uri, "file://") ||
                 g_str_has_prefix(uri, "http://") ||
                 g_str_has_prefix(uri, "https://")) {
-                new_tab(b, uri);
+                new_tab(win, uri);
                 opened++;
             }
         }
@@ -514,7 +537,7 @@ static void tab_drop_open(Tab *tab)
             *nl = '\0';
         if (looks_like_url(line)) {
             char *uri = normalize_uri(line);
-            new_tab(b, uri);
+            new_tab(win, uri);
             g_free(uri);
         }
         g_free(line);
@@ -621,7 +644,7 @@ static const GtkTargetEntry WINDOW_DROP_TARGETS[] = {
 
 static gboolean on_window_drag_data_received(GtkWidget *w, GdkDragContext *ctx, gint x,
                                              gint y, GtkSelectionData *sd, guint info,
-                                             guint time, Browser *b)
+                                             guint time, Win *win)
 {
     (void)w; (void)ctx; (void)x; (void)y; (void)info; (void)time;
     if (!sd)
@@ -634,7 +657,7 @@ static gboolean on_window_drag_data_received(GtkWidget *w, GdkDragContext *ctx, 
                 if (g_str_has_prefix(uris[i], "file://") ||
                     g_str_has_prefix(uris[i], "http://") ||
                     g_str_has_prefix(uris[i], "https://")) {
-                    new_tab(b, uris[i]);
+                    new_tab(win, uris[i]);
                     opened++;
                 }
             }
@@ -649,7 +672,7 @@ static gboolean on_window_drag_data_received(GtkWidget *w, GdkDragContext *ctx, 
                 *nl = '\0';
             if (looks_like_url(line)) {
                 char *uri = normalize_uri(line);
-                new_tab(b, uri);
+                new_tab(win, uri);
                 g_free(uri);
             }
             g_free(text);
@@ -660,77 +683,176 @@ static gboolean on_window_drag_data_received(GtkWidget *w, GdkDragContext *ctx, 
 
 /* ---------- tabs ---------- */
 
-static void close_tab(Browser *b, GtkWidget *page)
+static void close_tab(Win *win, GtkWidget *page)
 {
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
     Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
     if (tab) {
         tab_drop_cleanup(tab);
         drop_source_file(tab, NULL);
-        if (tab == b->find_tab) {
+        if (tab == win->find_tab) {
             webkit_find_controller_search_finish(
                 webkit_web_view_get_find_controller(tab->view));
-            b->find_tab = NULL;
+            win->find_tab = NULL;
         }
         const char *uri = webkit_web_view_get_uri(tab->view);
         if (uri) {
             ClosedTab *ct = g_new0(ClosedTab, 1);
             ct->uri = g_strdup(uri);
             ct->title = g_strdup(webkit_web_view_get_title(tab->view));
-            if (!b->closed_tabs)
-                b->closed_tabs = g_ptr_array_new();
-            g_ptr_array_add(b->closed_tabs, ct);
-            while (b->closed_tabs->len > 32) {
-                ClosedTab *old = g_ptr_array_index(b->closed_tabs, 0);
+            if (!win->browser->closed_tabs)
+                win->browser->closed_tabs = g_ptr_array_new();
+            g_ptr_array_add(win->browser->closed_tabs, ct);
+            while (win->browser->closed_tabs->len > 32) {
+                ClosedTab *old = g_ptr_array_index(win->browser->closed_tabs, 0);
                 g_free(old->uri);
                 g_free(old->title);
                 g_free(old);
-                g_ptr_array_remove_index(b->closed_tabs, 0);
+                g_ptr_array_remove_index(win->browser->closed_tabs, 0);
             }
         }
     }
     gtk_notebook_remove_page(nb, gtk_notebook_page_num(nb, page));
-    if (gtk_notebook_get_n_pages(nb) == 0)
-        gtk_widget_destroy(b->window);
+    if (gtk_notebook_get_n_pages(nb) == 0) {
+        close_window(win);
+        return;
+    }
+    update_tabbar(win);
+}
+
+/* Move a tab out of its window into a brand-new one (the "detach" action).
+ * The page widget and its web view are preserved, so no reload happens. */
+static void detach_tab(Win *win, GtkWidget *page)
+{
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+    if (!page || gtk_notebook_get_n_pages(nb) <= 1)
+        return; /* nothing to split off */
+    Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+    if (!tab || !tab->tab_label)
+        return;
+    Browser *b = win->browser;
+
+    if (tab == win->find_tab) {
+        webkit_find_controller_search_finish(
+            webkit_web_view_get_find_controller(tab->view));
+        win->find_tab = NULL;
+        win->find_pos = 0;
+        win->find_count = 0;
+        gtk_label_set_text(GTK_LABEL(win->find_label), "");
+        gtk_widget_hide(win->find_bar);
+    }
+
+    /* tab->tab_label holds a ref, so the label survives remove_page and
+     * can be re-attached in the new window. GTK3 also destroys the page
+     * itself on removal if the notebook is its only ref, so take a
+     * temporary page ref to keep it alive across the move. */
+    g_object_ref(page);
+    gtk_notebook_remove_page(nb, gtk_notebook_page_num(nb, page));
+    Win *nw = new_window(b);
+    gtk_notebook_append_page(GTK_NOTEBOOK(nw->notebook), page, tab->tab_label);
+    g_object_unref(page);
+    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(nw->notebook), page, TRUE);
+    tab->win = nw;
+
+    /* refresh both windows' chrome and tab-strip visibility */
+    update_tabbar(win);
+    update_url_entry(win, current_tab(win));
+    update_nav_buttons(win, current_tab(win));
+    update_window_title(win, current_tab(win));
+    update_tabbar(nw);
+    update_url_entry(nw, current_tab(nw));
+    update_nav_buttons(nw, current_tab(nw));
+    update_window_title(nw, current_tab(nw));
+}
+
+static void detach_tab_activate(gpointer page)
+{
+    Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+    if (tab)
+        detach_tab(tab->win, page);
 }
 
 static void on_tab_close_clicked(GtkWidget *page, gpointer unused)
 {
+    (void)unused;
     Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-    close_tab(tab->browser, page);
+    close_tab(tab->win, page);
 }
 
 static gboolean on_tab_button_press(GtkWidget *w, GdkEventButton *e, gpointer page)
 {
+    (void)w;
+    Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
     if (e->type == GDK_2BUTTON_PRESS ||
         (e->type == GDK_BUTTON_PRESS && e->button == GDK_BUTTON_MIDDLE)) {
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        close_tab(tab->browser, page);
+        close_tab(tab->win, page);
+        return TRUE;
+    }
+    if (e->type == GDK_BUTTON_PRESS && e->button == GDK_BUTTON_SECONDARY) {
+        /* right-click: offer to move the tab into its own window */
+        GtkWidget *menu = gtk_menu_new();
+        GtkWidget *item = gtk_menu_item_new_with_label("Move to New Window");
+        g_signal_connect_swapped(item, "activate",
+                                 G_CALLBACK(detach_tab_activate), page);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        gtk_widget_show_all(menu);
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)e);
         return TRUE;
     }
     return FALSE;
+}
+
+/* Show the tab strip only when a window has 2+ tabs, or when the user has
+ * disabled single-tab auto-hide. For a single tab the notebook is given an
+ * empty 0x0 label so the whole strip (title + close button) collapses away;
+ * the page itself is untouched. */
+static void update_tabbar(Win *win)
+{
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+    int n = gtk_notebook_get_n_pages(nb);
+    gboolean show = (n >= 2) || !win->browser->hide_tabbar;
+    for (int i = 0; i < n; i++) {
+        GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
+        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+        if (!tab || !tab->tab_label)
+            continue;
+        gtk_notebook_set_tab_label(nb, page,
+                                   show ? tab->tab_label : win->empty_tab_label);
+    }
+}
+
+/* Destructor for the "tab" data attached to each page; frees the tab and
+ * everything it privately owns. The web view and label box are children of
+ * the page / label and are freed by the container. */
+static void tab_destroy(Tab *tab)
+{
+    tab_drop_cancel(tab);
+    drop_source_file(tab, NULL);
+    g_clear_object(&tab->tab_label);
+    g_free(tab);
 }
 
 /* ---------- web view signal handlers ---------- */
 
 static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab)
 {
-    Browser *b = tab->browser;
+    Win *win = tab->win;
+    Browser *b = win->browser;
     if (event == WEBKIT_LOAD_FINISHED) {
         const char *uri = webkit_web_view_get_uri(view);
         drop_source_file(tab, uri);
         if (uri)
             history_add(b, uri);
     }
-    if (event == WEBKIT_LOAD_STARTED && tab == b->find_tab) {
+    if (event == WEBKIT_LOAD_STARTED && tab == win->find_tab) {
         webkit_find_controller_search_finish(
             webkit_web_view_get_find_controller(view));
-        b->find_tab = NULL;
+        win->find_tab = NULL;
     }
-    if (current_tab(b) == tab) {
-        update_url_entry(b, tab);
-        update_nav_buttons(b, tab);
-        update_window_title(b, tab);
+    if (current_tab(win) == tab) {
+        update_url_entry(win, tab);
+        update_nav_buttons(win, tab);
+        update_window_title(win, tab);
     }
 }
 
@@ -741,35 +863,35 @@ static void on_notify_title(WebKitWebView *view, GParamSpec *ps, Tab *tab)
     const char *text = (title && *title) ? title : (uri ? uri : "New Tab");
     gtk_label_set_text(GTK_LABEL(tab->title_label), truncate_tab_title(text));
     gtk_widget_set_tooltip_text(tab->title_label, text);
-    if (current_tab(tab->browser) == tab)
-        update_window_title(tab->browser, tab);
+    if (current_tab(tab->win) == tab)
+        update_window_title(tab->win, tab);
 }
 
 static void on_notify_uri(WebKitWebView *view, GParamSpec *ps, Tab *tab)
 {
-    if (current_tab(tab->browser) == tab)
-        update_url_entry(tab->browser, tab);
+    if (current_tab(tab->win) == tab)
+        update_url_entry(tab->win, tab);
 }
 
 static void on_notify_loading(WebKitWebView *view, GParamSpec *ps, Tab *tab)
 {
-    Browser *b = tab->browser;
-    if (current_tab(b) != tab)
+    Win *win = tab->win;
+    if (current_tab(win) != tab)
         return;
     if (!webkit_web_view_is_loading(view))
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(b->progress), 0);
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(win->progress), 0);
 }
 
 static void on_notify_progress(WebKitWebView *view, GParamSpec *ps, Tab *tab)
 {
-    Browser *b = tab->browser;
-    if (current_tab(b) != tab)
+    Win *win = tab->win;
+    if (current_tab(win) != tab)
         return;
     if (webkit_web_view_is_loading(view))
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(b->progress),
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(win->progress),
                                       webkit_web_view_get_estimated_load_progress(view));
     else
-        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(b->progress), 0);
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(win->progress), 0);
 }
 
 static void on_notify_favicon(WebKitWebView *view, GParamSpec *ps, Tab *tab)
@@ -783,8 +905,8 @@ static void on_notify_favicon(WebKitWebView *view, GParamSpec *ps, Tab *tab)
     cairo_surface_destroy(surface);
     if (!pixbuf)
         return;
-    if (current_tab(tab->browser) == tab)
-        gtk_window_set_icon(GTK_WINDOW(tab->browser->window), pixbuf);
+    if (current_tab(tab->win) == tab)
+        gtk_window_set_icon(GTK_WINDOW(tab->win->window), pixbuf);
     gtk_image_set_from_pixbuf(GTK_IMAGE(tab->icon_image), pixbuf);
     g_object_unref(pixbuf);
 }
@@ -804,7 +926,7 @@ static void on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision
         WebKitURIRequest *request = webkit_navigation_action_get_request(action);
         const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
         if (uri)
-            new_tab(tab->browser, uri);
+            new_tab(tab->win, uri);
         webkit_policy_decision_ignore(decision);
         return;
     }
@@ -817,8 +939,9 @@ static void on_download_started(WebKitWebContext *context, WebKitDownload *downl
     const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
     const char *suggested = uri ? g_path_get_basename(uri) : "download";
 
+    Win *aw = active_window(b);
     GtkWidget *dialog = gtk_file_chooser_dialog_new("Save file",
-                                                    GTK_WINDOW(b->window),
+                                                    aw ? GTK_WINDOW(aw->window) : NULL,
                                                     GTK_FILE_CHOOSER_ACTION_SAVE,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_Save", GTK_RESPONSE_ACCEPT,
@@ -842,12 +965,13 @@ static void on_download_started(WebKitWebContext *context, WebKitDownload *downl
 
 /* ---------- tab creation ---------- */
 
-static GtkWidget *new_tab(Browser *b, const char *uri)
+static GtkWidget *new_tab(Win *win, const char *uri)
 {
+    Browser *b = win->browser;
     GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     WebKitWebView *view = WEBKIT_WEB_VIEW(webkit_web_view_new());
     Tab *tab = g_new0(Tab, 1);
-    tab->browser = b;
+    tab->win = win;
     tab->view = view;
 
     WebKitSettings *settings = webkit_web_view_get_settings(view);
@@ -857,9 +981,9 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     if (b->user_agent && *b->user_agent)
         webkit_settings_set_user_agent(settings, b->user_agent);
     WebKitFindController *fc = webkit_web_view_get_find_controller(view);
-    g_signal_connect(fc, "found-text", G_CALLBACK(on_find_found_text), b);
-    g_signal_connect(fc, "counted-matches", G_CALLBACK(on_find_counted_matches), b);
-    g_signal_connect(fc, "failed-to-find-text", G_CALLBACK(on_find_failed), b);
+    g_signal_connect(fc, "found-text", G_CALLBACK(on_find_found_text), win);
+    g_signal_connect(fc, "counted-matches", G_CALLBACK(on_find_counted_matches), win);
+    g_signal_connect(fc, "failed-to-find-text", G_CALLBACK(on_find_failed), win);
 
     /* tab label: favicon + title + close button */
     GtkWidget *label_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -880,9 +1004,12 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
 
     gtk_box_pack_start(GTK_BOX(page), GTK_WIDGET(view), TRUE, TRUE, 0);
 
-    g_object_set_data_full(G_OBJECT(page), "tab", tab, g_free);
-    gtk_notebook_append_page(GTK_NOTEBOOK(b->notebook), page, label_box);
-    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(b->notebook), page, TRUE);
+    g_object_set_data_full(G_OBJECT(page), "tab", tab, (GDestroyNotify)tab_destroy);
+    gtk_notebook_append_page(GTK_NOTEBOOK(win->notebook), page, label_box);
+    gtk_notebook_set_tab_reorderable(GTK_NOTEBOOK(win->notebook), page, TRUE);
+    /* keep a ref on the label so detach_tab can re-attach it in another
+     * window (remove_page would otherwise destroy it) */
+    tab->tab_label = g_object_ref(label_box);
 
     /* GtkNotebook tab labels are not container children, so
      * gtk_widget_show_all() never reaches them — show explicitly.
@@ -913,33 +1040,37 @@ static GtkWidget *new_tab(Browser *b, const char *uri)
     webkit_web_view_load_uri(view, load_uri_str);
     g_free(load_uri_str);
 
-    gtk_notebook_set_current_page(GTK_NOTEBOOK(b->notebook),
-                                  gtk_notebook_page_num(GTK_NOTEBOOK(b->notebook), page));
-    update_url_entry(b, tab);
-    update_nav_buttons(b, tab);
-    update_window_title(b, tab);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(win->notebook),
+                                  gtk_notebook_page_num(GTK_NOTEBOOK(win->notebook), page));
+    update_tabbar(win);
+    update_url_entry(win, tab);
+    update_nav_buttons(win, tab);
+    update_window_title(win, tab);
     return page;
 }
 
 /* ---------- toolbar / entry handlers ---------- */
 
-static void on_back_clicked(GtkButton *btn, Browser *b)
+static void on_back_clicked(GtkButton *btn, Win *win)
 {
-    Tab *tab = current_tab(b);
+    (void)btn;
+    Tab *tab = current_tab(win);
     if (tab && webkit_web_view_can_go_back(tab->view))
         webkit_web_view_go_back(tab->view);
 }
 
-static void on_forward_clicked(GtkButton *btn, Browser *b)
+static void on_forward_clicked(GtkButton *btn, Win *win)
 {
-    Tab *tab = current_tab(b);
+    (void)btn;
+    Tab *tab = current_tab(win);
     if (tab && webkit_web_view_can_go_forward(tab->view))
         webkit_web_view_go_forward(tab->view);
 }
 
-static void on_reload_clicked(GtkButton *btn, Browser *b)
+static void on_reload_clicked(GtkButton *btn, Win *win)
 {
-    Tab *tab = current_tab(b);
+    (void)btn;
+    Tab *tab = current_tab(win);
     if (!tab)
         return;
     if (webkit_web_view_is_loading(tab->view))
@@ -948,22 +1079,25 @@ static void on_reload_clicked(GtkButton *btn, Browser *b)
         webkit_web_view_reload(tab->view);
 }
 
-static void on_entry_activate(GtkEntry *entry, Browser *b)
+static void on_entry_activate(GtkEntry *entry, Win *win)
 {
-    navigate_from_entry(b);
+    (void)entry;
+    navigate_from_entry(win);
 }
 
-static void on_new_tab_clicked(GtkButton *btn, Browser *b)
+static void on_new_tab_clicked(GtkButton *btn, Win *win)
 {
-    new_tab(b, NULL);
+    (void)btn;
+    new_tab(win, NULL);
 }
 
-static void on_close_tab_clicked(GtkButton *btn, Browser *b)
+static void on_close_tab_clicked(GtkButton *btn, Win *win)
 {
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    (void)btn;
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
     GtkWidget *page = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
     if (page)
-        close_tab(b, page);
+        close_tab(win, page);
 }
 
 /*
@@ -972,138 +1106,140 @@ static void on_close_tab_clicked(GtkButton *btn, Browser *b)
  * argument, so we must use that — reading current_page here is what used
  * to make the URL bar / nav buttons / title show the previous tab.
  */
-static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, Browser *b)
+static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, Win *win)
 {
+    (void)nb; (void)num;
     Tab *tab = page ? g_object_get_data(G_OBJECT(page), "tab") : NULL;
-    if (b->find_tab) {
+    if (win->find_tab) {
         webkit_find_controller_search_finish(
-            webkit_web_view_get_find_controller(b->find_tab->view));
-        b->find_tab = NULL;
-        b->find_pos = 0;
-        b->find_count = 0;
-        gtk_label_set_text(GTK_LABEL(b->find_label), "");
-        gtk_widget_hide(b->find_bar);
+            webkit_web_view_get_find_controller(win->find_tab->view));
+        win->find_tab = NULL;
+        win->find_pos = 0;
+        win->find_count = 0;
+        gtk_label_set_text(GTK_LABEL(win->find_label), "");
+        gtk_widget_hide(win->find_bar);
     }
-    update_url_entry(b, tab);
-    update_nav_buttons(b, tab);
-    update_window_title(b, tab);
+    update_url_entry(win, tab);
+    update_nav_buttons(win, tab);
+    update_window_title(win, tab);
 }
 
 /* ---------- find in page (Ctrl+F) ---------- */
 
-static void find_set_count(Browser *b)
+static void find_set_count(Win *win)
 {
     char buf[24];
-    if (b->find_count > 0 && b->find_pos > 0)
-        g_snprintf(buf, sizeof(buf), "%u/%u", b->find_pos, b->find_count);
+    if (win->find_count > 0 && win->find_pos > 0)
+        g_snprintf(buf, sizeof(buf), "%u/%u", win->find_pos, win->find_count);
     else
         buf[0] = '\0';
-    gtk_label_set_text(GTK_LABEL(b->find_label), buf);
+    gtk_label_set_text(GTK_LABEL(win->find_label), buf);
 }
 
-static void on_find_found_text(GtkWidget *controller, guint pos, Browser *b)
+static void on_find_found_text(GtkWidget *controller, guint pos, Win *win)
 {
     (void)controller;
-    b->find_pos = pos;
-    find_set_count(b);
+    win->find_pos = pos;
+    find_set_count(win);
 }
 
-static void on_find_counted_matches(GtkWidget *controller, guint count, Browser *b)
+static void on_find_counted_matches(GtkWidget *controller, guint count, Win *win)
 {
     (void)controller;
-    b->find_count = count;
+    win->find_count = count;
     if (count == 0)
-        gtk_label_set_text(GTK_LABEL(b->find_label), "No results");
+        gtk_label_set_text(GTK_LABEL(win->find_label), "No results");
     else
-        find_set_count(b);
+        find_set_count(win);
 }
 
-static void on_find_failed(GtkWidget *controller, Browser *b)
+static void on_find_failed(GtkWidget *controller, Win *win)
 {
     (void)controller;
-    b->find_pos = 0;
-    gtk_label_set_text(GTK_LABEL(b->find_label), "No results");
+    win->find_pos = 0;
+    gtk_label_set_text(GTK_LABEL(win->find_label), "No results");
 }
 
-static void find_open(Browser *b)
+static void find_open(Win *win)
 {
-    gtk_widget_show(b->find_bar);
-    gtk_widget_grab_focus(b->find_entry);
-    gtk_editable_select_region(GTK_EDITABLE(b->find_entry), 0, -1);
+    gtk_widget_show(win->find_bar);
+    gtk_widget_grab_focus(win->find_entry);
+    gtk_editable_select_region(GTK_EDITABLE(win->find_entry), 0, -1);
 }
 
-static void find_close(Browser *b)
+static void find_close(Win *win)
 {
-    if (b->find_tab) {
+    if (win->find_tab) {
         webkit_find_controller_search_finish(
-            webkit_web_view_get_find_controller(b->find_tab->view));
-        b->find_tab = NULL;
+            webkit_web_view_get_find_controller(win->find_tab->view));
+        win->find_tab = NULL;
     }
-    b->find_pos = 0;
-    b->find_count = 0;
-    gtk_label_set_text(GTK_LABEL(b->find_label), "");
-    gtk_widget_hide(b->find_bar);
+    win->find_pos = 0;
+    win->find_count = 0;
+    gtk_label_set_text(GTK_LABEL(win->find_label), "");
+    gtk_widget_hide(win->find_bar);
 }
 
-static void on_find_changed(GtkEntry *entry, Browser *b)
+static void on_find_changed(GtkEntry *entry, Win *win)
 {
     const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
-    if (!b->find_tab)
-        b->find_tab = current_tab(b);
-    WebKitFindController *fc = b->find_tab ?
-        webkit_web_view_get_find_controller(b->find_tab->view) : NULL;
+    if (!win->find_tab)
+        win->find_tab = current_tab(win);
+    WebKitFindController *fc = win->find_tab ?
+        webkit_web_view_get_find_controller(win->find_tab->view) : NULL;
     if (!fc)
         return;
     if (!*text) {
         webkit_find_controller_search_finish(fc);
-        b->find_pos = 0;
-        b->find_count = 0;
-        gtk_label_set_text(GTK_LABEL(b->find_label), "");
+        win->find_pos = 0;
+        win->find_count = 0;
+        gtk_label_set_text(GTK_LABEL(win->find_label), "");
         return;
     }
-    b->find_pos = 0;
-    b->find_count = 0;
-    gtk_label_set_text(GTK_LABEL(b->find_label), "Searching…");
+    win->find_pos = 0;
+    win->find_count = 0;
+    gtk_label_set_text(GTK_LABEL(win->find_label), "Searching…");
     webkit_find_controller_search(fc, text, WEBKIT_FIND_OPTIONS_NONE, G_MAXUINT);
 }
 
-static void on_find_step(Browser *b, gboolean prev)
+static void on_find_step(Win *win, gboolean prev)
 {
-    if (!b->find_tab)
+    if (!win->find_tab)
         return;
-    WebKitFindController *fc = webkit_web_view_get_find_controller(b->find_tab->view);
+    WebKitFindController *fc = webkit_web_view_get_find_controller(win->find_tab->view);
     if (prev)
         webkit_find_controller_search_previous(fc);
     else
         webkit_find_controller_search_next(fc);
 }
 
-static void on_find_next_clicked(GtkButton *btn, Browser *b)
+static void on_find_next_clicked(GtkButton *btn, Win *win)
 {
     (void)btn;
-    on_find_step(b, FALSE);
+    on_find_step(win, FALSE);
 }
 
-static void on_find_prev_clicked(GtkButton *btn, Browser *b)
+static void on_find_prev_clicked(GtkButton *btn, Win *win)
 {
     (void)btn;
-    on_find_step(b, TRUE);
+    on_find_step(win, TRUE);
 }
 
-static void on_find_close_clicked(GtkButton *btn, Browser *b)
+static void on_find_close_clicked(GtkButton *btn, Win *win)
 {
     (void)btn;
-    find_close(b);
+    find_close(win);
 }
 
-static gboolean on_find_key_press(GtkWidget *w, GdkEventKey *e, Browser *b)
+static gboolean on_find_key_press(GtkWidget *w, GdkEventKey *e, Win *win)
 {
+    (void)w;
     if (e->keyval == GDK_KEY_Escape) {
-        find_close(b);
+        find_close(win);
         return TRUE;
     }
     if (e->keyval == GDK_KEY_Return) {
-        on_find_step(b, e->state & GDK_SHIFT_MASK);
+        on_find_step(win, e->state & GDK_SHIFT_MASK);
         return TRUE;
     }
     return FALSE;
@@ -1121,24 +1257,37 @@ static char *session_path(void)
 
 static void session_save(Browser *b)
 {
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-    int n = MIN(gtk_notebook_get_n_pages(nb), SESSION_MAX_TABS);
     GKeyFile *kf = g_key_file_new();
-    g_key_file_set_integer(kf, "session", "count", n);
-    for (int i = 0; i < n; i++) {
-        GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        const char *uri = tab ? webkit_web_view_get_uri(tab->view) : NULL;
-        const char *title = tab ? webkit_web_view_get_title(tab->view) : NULL;
-        char *k;
-        if (uri && *uri) {
-            k = g_strdup_printf("uri-%d", i);
+    g_key_file_set_integer(kf, "session", "windows",
+                           b->windows ? b->windows->len : 0);
+    for (guint w = 0; b->windows && w < b->windows->len; w++) {
+        Win *win = g_ptr_array_index(b->windows, w);
+        GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+        int n = MIN(gtk_notebook_get_n_pages(nb), SESSION_MAX_TABS);
+        /* window 0 keeps the legacy key layout so older sessions still load */
+        if (w == 0)
+            g_key_file_set_integer(kf, "session", "count", n);
+        else {
+            char *kn = g_strdup_printf("win%u.n", w);
+            g_key_file_set_integer(kf, "session", kn, n);
+            g_free(kn);
+        }
+        for (int i = 0; i < n; i++) {
+            GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
+            Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+            const char *uri = tab ? webkit_web_view_get_uri(tab->view) : NULL;
+            const char *title = tab ? webkit_web_view_get_title(tab->view) : NULL;
+            if (!(uri && *uri))
+                continue;
+            char *k = (w == 0) ? g_strdup_printf("uri-%d", i)
+                               : g_strdup_printf("win%u.uri-%d", w, i);
             g_key_file_set_string(kf, "session", k, uri);
             g_free(k);
             if (title && *title) {
-                k = g_strdup_printf("title-%d", i);
-                g_key_file_set_string(kf, "session", k, title);
-                g_free(k);
+                char *kt = (w == 0) ? g_strdup_printf("title-%d", i)
+                                    : g_strdup_printf("win%u.title-%d", w, i);
+                g_key_file_set_string(kf, "session", kt, title);
+                g_free(kt);
             }
         }
     }
@@ -1151,8 +1300,10 @@ static void session_save(Browser *b)
     g_key_file_unref(kf);
 }
 
-/* Reopen the last session's tabs. Returns TRUE if any were restored. */
-static gboolean session_restore(Browser *b)
+/* Reopen the last session's tabs across all windows. Window 0 is restored
+ * into first_win; the remaining windows are recreated. Returns TRUE if any
+ * tab was restored. */
+static gboolean session_restore(Browser *b, Win *first_win)
 {
     GKeyFile *kf = g_key_file_new();
     char *path = session_path();
@@ -1160,28 +1311,43 @@ static gboolean session_restore(Browser *b)
     g_free(path);
     if (!ok)
         return FALSE;
-    int n = g_key_file_get_integer(kf, "session", "count", NULL);
+    int W = g_key_file_get_integer(kf, "session", "windows", NULL);
+    if (W <= 0)
+        W = g_key_file_has_key(kf, "session", "count", NULL) ? 1 : 0;
     gboolean any = FALSE;
-    for (int i = 0; n > 0 && i < n && i < SESSION_MAX_TABS; i++) {
-        char *k = g_strdup_printf("uri-%d", i);
-        const char *uri = g_key_file_get_string(kf, "session", k, NULL);
-        g_free(k);
-        if (!uri)
-            continue;
-        GtkWidget *page = new_tab(b, uri);
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        if (tab) {
-            char *kt = g_strdup_printf("title-%d", i);
-            const char *title = g_key_file_get_string(kf, "session", kt, NULL);
-            g_free(kt);
-            if (title)
-                gtk_label_set_text(GTK_LABEL(tab->title_label), title);
+    for (int w = 0; W > 0 && w < W && w < 32; w++) {
+        int n;
+        if (w == 0)
+            n = g_key_file_get_integer(kf, "session", "count", NULL);
+        else {
+            char *kn = g_strdup_printf("win%d.n", w);
+            n = g_key_file_get_integer(kf, "session", kn, NULL);
+            g_free(kn);
         }
-        any = TRUE;
+        if (n <= 0)
+            continue;
+        Win *win = (w == 0) ? first_win : new_window(b);
+        for (int i = 0; i < n && i < SESSION_MAX_TABS; i++) {
+            char *k = (w == 0) ? g_strdup_printf("uri-%d", i)
+                               : g_strdup_printf("win%d.uri-%d", w, i);
+            const char *uri = g_key_file_get_string(kf, "session", k, NULL);
+            g_free(k);
+            if (!uri)
+                continue;
+            GtkWidget *page = new_tab(win, uri);
+            Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
+            if (tab) {
+                char *kt = (w == 0) ? g_strdup_printf("title-%d", i)
+                                    : g_strdup_printf("win%d.title-%d", w, i);
+                const char *title = g_key_file_get_string(kf, "session", kt, NULL);
+                g_free(kt);
+                if (title)
+                    gtk_label_set_text(GTK_LABEL(tab->title_label), title);
+            }
+            any = TRUE;
+        }
     }
     g_key_file_unref(kf);
-    if (any)
-        gtk_notebook_set_current_page(GTK_NOTEBOOK(b->notebook), 0);
     return any;
 }
 
@@ -1230,19 +1396,31 @@ static void on_adblock_toggled(GtkToggleButton *btn, Browser *b)
     gtk_toggle_button_set_active(btn, b->adblock_enabled);
 }
 
+/* Call fn(tab, data) for every open tab in every window. */
+static void for_each_tab(Browser *b, void (*fn)(Tab *tab, gpointer), gpointer data)
+{
+    for (guint w = 0; b->windows && w < b->windows->len; w++) {
+        GtkNotebook *nb = GTK_NOTEBOOK(((Win *)g_ptr_array_index(b->windows, w))->notebook);
+        int n = gtk_notebook_get_n_pages(nb);
+        for (int i = 0; i < n; i++) {
+            Tab *tab = g_object_get_data(G_OBJECT(gtk_notebook_get_nth_page(nb, i)), "tab");
+            if (tab)
+                fn(tab, data);
+        }
+    }
+}
+
+static void tab_apply_devtools(Tab *tab, gpointer data)
+{
+    Browser *b = data;
+    WebKitSettings *settings = webkit_web_view_get_settings(tab->view);
+    webkit_settings_set_enable_developer_extras(settings, b->devtools_enabled);
+}
+
 static void on_devtools_toggled(GtkToggleButton *btn, Browser *b)
 {
     b->devtools_enabled = gtk_toggle_button_get_active(btn);
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-    int n = gtk_notebook_get_n_pages(nb);
-    for (int i = 0; i < n; i++) {
-        GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        if (tab) {
-            WebKitSettings *settings = webkit_web_view_get_settings(tab->view);
-            webkit_settings_set_enable_developer_extras(settings, b->devtools_enabled);
-        }
-    }
+    for_each_tab(b, tab_apply_devtools, b);
 }
 
 /* Refresh the toolbar "trackers blocked" counter. Runs from a 1s timeout
@@ -1250,12 +1428,14 @@ static void on_devtools_toggled(GtkToggleButton *btn, Browser *b)
 static gboolean update_blocked_label(gpointer data)
 {
     Browser *b = data;
-    if (!b->blocked_label)
-        return G_SOURCE_CONTINUE;
     guint64 count = b->proxy ? adb_proxy_blocked_count(b->proxy) : 0;
     char buf[48];
     g_snprintf(buf, sizeof(buf), "%llu", (unsigned long long)count);
-    gtk_label_set_text(GTK_LABEL(b->blocked_label), buf);
+    for (guint w = 0; b->windows && w < b->windows->len; w++) {
+        Win *win = g_ptr_array_index(b->windows, w);
+        if (win->blocked_label)
+            gtk_label_set_text(GTK_LABEL(win->blocked_label), buf);
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -1269,7 +1449,7 @@ static void on_blocked_clicked(GtkButton *btn, Browser *b)
                "%llu tracker requests blocked so far.\n\n"
                "Toggle filtering in Settings.",
                (unsigned long long)count);
-    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(b->window),
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)),
                                                GTK_DIALOG_MODAL,
                                                GTK_MESSAGE_INFO,
                                                GTK_BUTTONS_OK, "%s", buf);
@@ -1295,19 +1475,24 @@ static void on_new_tab_url_changed(GtkEntry *entry, Browser *b)
     save_settings(b);
 }
 
+static void tab_apply_zoom(Tab *tab, gpointer data)
+{
+    Browser *b = data;
+    webkit_web_view_set_zoom_level(tab->view, b->default_zoom / 100.0);
+}
+
 static void on_zoom_changed(GtkSpinButton *spin, Browser *b)
 {
     b->default_zoom = (int)gtk_spin_button_get_value(spin);
-    double z = b->default_zoom / 100.0;
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-    int n = gtk_notebook_get_n_pages(nb);
-    for (int i = 0; i < n; i++) {
-        GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        if (tab)
-            webkit_web_view_set_zoom_level(tab->view, z);
-    }
+    for_each_tab(b, tab_apply_zoom, b);
     save_settings(b);
+}
+
+static void tab_apply_ua(Tab *tab, gpointer data)
+{
+    Browser *b = data;
+    WebKitSettings *s = webkit_web_view_get_settings(tab->view);
+    webkit_settings_set_user_agent(s, b->user_agent);
 }
 
 static void on_user_agent_changed(GtkEntry *entry, Browser *b)
@@ -1316,16 +1501,7 @@ static void on_user_agent_changed(GtkEntry *entry, Browser *b)
     g_free(b->user_agent);
     b->user_agent = (t && *t) ? g_strdup(t) : NULL;
     /* NULL restores the WebKit default UA. */
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-    int n = gtk_notebook_get_n_pages(nb);
-    for (int i = 0; i < n; i++) {
-        GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
-        Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-        if (tab) {
-            WebKitSettings *s = webkit_web_view_get_settings(tab->view);
-            webkit_settings_set_user_agent(s, b->user_agent);
-        }
-    }
+    for_each_tab(b, tab_apply_ua, b);
     save_settings(b);
 }
 
@@ -1333,7 +1509,7 @@ static void on_blocklist_browse(GtkButton *btn, Browser *b)
 {
     (void)btn;
     GtkWidget *chooser = gtk_file_chooser_dialog_new("Choose blocklist file",
-                                                    GTK_WINDOW(b->window),
+                                                    GTK_WINDOW(win_toplevel(b)),
                                                     GTK_FILE_CHOOSER_ACTION_OPEN,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_Open", GTK_RESPONSE_ACCEPT,
@@ -1362,6 +1538,14 @@ static void on_blocklist_browse(GtkButton *btn, Browser *b)
 static void on_restore_toggled(GtkToggleButton *btn, Browser *b)
 {
     b->restore_session = gtk_toggle_button_get_active(btn);
+    save_settings(b);
+}
+
+static void on_hide_tabbar_toggled(GtkToggleButton *btn, Browser *b)
+{
+    b->hide_tabbar = gtk_toggle_button_get_active(btn);
+    for (guint w = 0; b->windows && w < b->windows->len; w++)
+        update_tabbar(g_ptr_array_index(b->windows, w));
     save_settings(b);
 }
 
@@ -1425,7 +1609,9 @@ static void manager_open(GtkButton *btn, gpointer data)
         return;
     gchar *uri;
     gtk_tree_model_get(model, &iter, 0, &uri, -1);
-    new_tab(m->b, uri);
+    Win *w = active_window(m->b);
+    if (w)
+        new_tab(w, uri);
     g_free(uri);
 }
 
@@ -1521,7 +1707,7 @@ static void on_manage_history_clicked(GtkButton *btn, Browser *b)
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(win), "History and Bookmarks");
     gtk_window_set_default_size(GTK_WINDOW(win), 720, 480);
-    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(b->window));
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(win_toplevel(b)));
     gtk_window_set_modal(GTK_WINDOW(win), TRUE);
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 8);
@@ -1550,13 +1736,13 @@ static void on_manage_history_clicked(GtkButton *btn, Browser *b)
     }
     gtk_box_pack_start(GTK_BOX(vbox), nb, TRUE, TRUE, 0);
     gtk_widget_show_all(win);
-    gtk_widget_grab_focus(b->window);
+    gtk_widget_grab_focus(win_toplevel(b));
 }
 
 static void on_settings_clicked(GtkButton *btn, Browser *b)
 {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Settings",
-                                                    GTK_WINDOW(b->window),
+                                                    GTK_WINDOW(win_toplevel(b)),
                                                     GTK_DIALOG_MODAL,
                                                     "_Cancel", GTK_RESPONSE_REJECT,
                                                     "_Save", GTK_RESPONSE_ACCEPT,
@@ -1618,6 +1804,13 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     gtk_widget_set_halign(restore_check, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(content), restore_check, FALSE, FALSE, 0);
 
+    GtkWidget *hide_tabbar_check = gtk_check_button_new_with_label(
+        "Hide the tab bar when a window has a single tab");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(hide_tabbar_check),
+                                 b->hide_tabbar);
+    gtk_widget_set_halign(hide_tabbar_check, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), hide_tabbar_check, FALSE, FALSE, 0);
+
     GtkWidget *zoom_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(zoom_row, GTK_ALIGN_START);
     GtkWidget *zoom_lbl = gtk_label_new("Default zoom:");
@@ -1659,6 +1852,8 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     g_signal_connect(custom_entry, "changed", G_CALLBACK(on_custom_search_changed), b);
     g_signal_connect(zoom_spin, "value-changed", G_CALLBACK(on_zoom_changed), b);
     g_signal_connect(restore_check, "toggled", G_CALLBACK(on_restore_toggled), b);
+    g_signal_connect(hide_tabbar_check, "toggled",
+                     G_CALLBACK(on_hide_tabbar_toggled), b);
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
@@ -1724,6 +1919,9 @@ static void load_settings(Browser *b)
         if (g_key_file_has_key(kf, "general", "restore", NULL))
             b->restore_session =
                 g_key_file_get_integer(kf, "general", "restore", NULL) != 0;
+        if (g_key_file_has_key(kf, "general", "hide_tabbar", NULL))
+            b->hide_tabbar =
+                g_key_file_get_integer(kf, "general", "hide_tabbar", NULL) != 0;
         b->home_url = g_key_file_get_string(kf, "general", "home", NULL);
         b->new_tab_url = g_key_file_get_string(kf, "general", "newtab", NULL);
         b->user_agent = g_key_file_get_string(kf, "general", "user_agent", NULL);
@@ -1754,6 +1952,8 @@ static void save_settings(Browser *b)
         g_key_file_set_string(kf, "adblock", "blocklist", b->blocklist_file);
     g_key_file_set_integer(kf, "general", "restore",
                            b->restore_session ? 1 : 0);
+    g_key_file_set_integer(kf, "general", "hide_tabbar",
+                           b->hide_tabbar ? 1 : 0);
     char *path = settings_path();
     char *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
@@ -1766,7 +1966,7 @@ static void save_settings(Browser *b)
 static gchar *ask_kp_password(Browser *b)
 {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("KeePass database",
-                                                    GTK_WINDOW(b->window),
+                                                    GTK_WINDOW(win_toplevel(b)),
                                                     GTK_DIALOG_MODAL,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_Unlock", GTK_RESPONSE_OK,
@@ -1844,10 +2044,10 @@ static void on_fill_js_done(GObject *source, GAsyncResult *res, gpointer user_da
     if (ok) {
         char buf[160];
         g_snprintf(buf, sizeof(buf), "Filled %s (%s).", fr->title, fr->user);
-        d = gtk_message_dialog_new(GTK_WINDOW(fr->b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(fr->b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", buf);
     } else {
-        d = gtk_message_dialog_new(GTK_WINDOW(fr->b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(fr->b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_WARNING, GTK_BUTTONS_OK,
                                    err ? err->message
                                        : "No login form found on this page.");
@@ -1866,7 +2066,8 @@ static void on_fill_js_done(GObject *source, GAsyncResult *res, gpointer user_da
  * field in the same form) with the given entry's values. */
 static void do_fill(Browser *b, KpEntry *e)
 {
-    Tab *tab = current_tab(b);
+    Win *w = active_window(b);
+    Tab *tab = w ? current_tab(w) : NULL;
     if (!tab)
         return;
     char *u = json_escape(e->username ? e->username : "");
@@ -1899,7 +2100,7 @@ static void do_fill(Browser *b, KpEntry *e)
 static KpEntry *choose_entry(Browser *b, const char *host, GPtrArray *matches)
 {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Choose password",
-                                                    GTK_WINDOW(b->window),
+                                                    GTK_WINDOW(win_toplevel(b)),
                                                     GTK_DIALOG_MODAL,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_Use", GTK_RESPONSE_OK,
@@ -1973,7 +2174,7 @@ static gboolean kp_job_done(gpointer data)
     }
 
     if (job->error) {
-        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
                                    "KeePass: %s", job->error);
         gtk_dialog_run(GTK_DIALOG(d));
@@ -1986,7 +2187,7 @@ static gboolean kp_job_done(gpointer data)
         char msg[64];
         g_snprintf(msg, sizeof(msg), "%u entries loaded from the database.",
                    (unsigned)job->entries->len);
-        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
         gtk_dialog_run(GTK_DIALOG(d));
         gtk_widget_destroy(d);
@@ -2006,7 +2207,7 @@ static gboolean kp_job_done(gpointer data)
     else if (matches->len > 1)
         pick = choose_entry(b, job->host, matches);
     else {
-        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
                                    "No KeePass entries found for %s.",
                                    job->host);
@@ -2028,12 +2229,13 @@ static void on_fill_button_clicked(GtkButton *btn, Browser *b)
 
 static void fill_login(Browser *b)
 {
-    Tab *tab = current_tab(b);
+    Win *w = active_window(b);
+    Tab *tab = w ? current_tab(w) : NULL;
     if (!tab)
         return;
     GtkWidget *d;
     if (!b->kp_db_path) {
-        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
                                    "No KeePass database configured.\n\n"
                                    "Choose a .kdbx file in Settings.");
@@ -2053,7 +2255,7 @@ static void fill_login(Browser *b)
     }
     g_clear_error(&err);
     if (!*host) {
-        d = gtk_message_dialog_new(GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
                                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
                                    "Open a login page first, then press "
                                    "Ctrl+Shift+L again.");
@@ -2089,7 +2291,7 @@ static void choose_kp_database(GtkButton *btn, Browser *b)
 {
     (void)btn;
     GtkWidget *chooser = gtk_file_chooser_dialog_new("Choose KeePass database",
-                                                    GTK_WINDOW(b->window),
+                                                    GTK_WINDOW(win_toplevel(b)),
                                                     GTK_FILE_CHOOSER_ACTION_OPEN,
                                                     "_Cancel", GTK_RESPONSE_CANCEL,
                                                     "_Open", GTK_RESPONSE_ACCEPT,
@@ -2124,7 +2326,7 @@ static void on_kp_test_clicked(GtkButton *btn, Browser *b)
 {
     (void)btn;
     if (!b->kp_db_path) {
-        GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(b->window),
+        GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(win_toplevel(b)),
                                               GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
                                               GTK_BUTTONS_OK,
                                               "Choose a database first.");
@@ -2453,15 +2655,18 @@ static void on_bookmark_row_activated(GtkListBox *list, GtkListBoxRow *row,
     (void)list;
     GtkWidget *inner = gtk_bin_get_child(GTK_BIN(row));
     char *uri = inner ? g_object_get_data(G_OBJECT(inner), "uri") : NULL;
-    if (uri)
-        new_tab(b, uri);
+    if (uri) {
+        Win *w = active_window(b);
+        if (w)
+            new_tab(w, uri);
+    }
 }
 
 static void on_bookmarks_clicked(GtkButton *btn, Browser *b)
 {
     (void)btn;
     GtkWidget *dialog = gtk_dialog_new_with_buttons(
-        "Bookmarks", GTK_WINDOW(b->window), GTK_DIALOG_MODAL,
+        "Bookmarks", GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
         "_Close", GTK_RESPONSE_CLOSE, NULL);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 520, 400);
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
@@ -2494,9 +2699,9 @@ static void on_bookmarks_clicked(GtkButton *btn, Browser *b)
 
 /* ---------- tab cycling ---------- */
 
-static void cycle_tab(Browser *b, int delta)
+static void cycle_tab(Win *win, int delta)
 {
-    GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
     int n = gtk_notebook_get_n_pages(nb);
     if (n <= 1)
         return;
@@ -2567,11 +2772,11 @@ static void on_source_fetched_view(GObject *src, GAsyncResult *res, gpointer use
 static void on_source_fetched_save(GObject *src, GAsyncResult *res, gpointer user_data)
 {
     Tab *tab = user_data;
-    Browser *b = tab->browser;
+    Browser *b = tab->win->browser;
     JSCValue *val = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, NULL);
     char *html = val ? jsc_value_to_string(val) : g_strdup("");
     GtkWidget *dlg = gtk_file_chooser_dialog_new("Save page as HTML",
-                                                 GTK_WINDOW(b->window),
+                                                 GTK_WINDOW(win_toplevel(b)),
                                                  GTK_FILE_CHOOSER_ACTION_SAVE,
                                                  "_Cancel", GTK_RESPONSE_CANCEL,
                                                  "_Save", GTK_RESPONSE_ACCEPT, NULL);
@@ -2624,9 +2829,11 @@ static void drop_source_file(Tab *tab, const char *uri)
 
 /* ---------- keyboard shortcuts ---------- */
 
-static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
+static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
 {
-    Tab *tab = current_tab(b);
+    (void)w;
+    Browser *b = win->browser;
+    Tab *tab = current_tab(win);
     guint keyval = event->keyval;
     GdkModifierType mods = event->state & gtk_accelerator_get_default_mod_mask();
 
@@ -2636,11 +2843,11 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
         return TRUE;
     }
     if (keyval == GDK_KEY_F11) {
-        if (b->fullscreen)
-            gtk_window_unfullscreen(GTK_WINDOW(b->window));
+        if (win->fullscreen)
+            gtk_window_unfullscreen(GTK_WINDOW(win->window));
         else
-            gtk_window_fullscreen(GTK_WINDOW(b->window));
-        b->fullscreen = !b->fullscreen;
+            gtk_window_fullscreen(GTK_WINDOW(win->window));
+        win->fullscreen = !win->fullscreen;
         return TRUE;
     }
     if ((mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) &&
@@ -2654,10 +2861,10 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
         if (b->closed_tabs && b->closed_tabs->len) {
             guint i = b->closed_tabs->len - 1;
             ClosedTab *ct = g_ptr_array_index(b->closed_tabs, i);
-            GtkWidget *page = new_tab(b, ct->uri);
-            Tab *tab = g_object_get_data(G_OBJECT(page), "tab");
-            if (tab && ct->title)
-                gtk_label_set_text(GTK_LABEL(tab->title_label), ct->title);
+            GtkWidget *page = new_tab(win, ct->uri);
+            Tab *rtab = g_object_get_data(G_OBJECT(page), "tab");
+            if (rtab && ct->title)
+                gtk_label_set_text(GTK_LABEL(rtab->title_label), ct->title);
             g_free(ct->uri);
             g_free(ct->title);
             g_free(ct);
@@ -2681,7 +2888,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
      * ISO_Left_Tab on some keymaps. */
     if ((keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) &&
         (mods & GDK_CONTROL_MASK)) {
-        cycle_tab(b, (mods & GDK_SHIFT_MASK) ? -1 : 1);
+        cycle_tab(win, (mods & GDK_SHIFT_MASK) ? -1 : 1);
         return TRUE;
     }
     if (mods != GDK_CONTROL_MASK)
@@ -2689,21 +2896,21 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
 
     switch (keyval) {
     case GDK_KEY_l:
-        gtk_widget_grab_focus(b->url_entry);
-        gtk_editable_select_region(GTK_EDITABLE(b->url_entry), 0, -1);
+        gtk_widget_grab_focus(win->url_entry);
+        gtk_editable_select_region(GTK_EDITABLE(win->url_entry), 0, -1);
         return TRUE;
     case GDK_KEY_t:
-        new_tab(b, NULL);
+        new_tab(win, NULL);
         return TRUE;
     case GDK_KEY_w: {
-        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+        GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
         GtkWidget *page = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
         if (page)
-            close_tab(b, page);
+            close_tab(win, page);
         return TRUE;
     }
     case GDK_KEY_f:
-        find_open(b);
+        find_open(win);
         return TRUE;
     case GDK_KEY_r:
         if (tab)
@@ -2754,7 +2961,7 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Browser *b)
     case GDK_KEY_7:
     case GDK_KEY_8:
     case GDK_KEY_9: {
-        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
+        GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
         int n = gtk_notebook_get_n_pages(nb);
         int idx = keyval - GDK_KEY_1;
         if (n > 0)
@@ -2824,18 +3031,19 @@ static gboolean send_command(const char *path, const char *cmd, char **response)
  * response string (caller frees). */
 static char *handle_control_command(Browser *b, const char *cmd)
 {
+    Win *win = active_window(b);
     if (g_str_has_prefix(cmd, "open ")) {
         const char *url = cmd + 5;
-        if (*url) {
+        if (*url && win) {
             char *uri = normalize_uri(url);
-            new_tab(b, uri);
+            new_tab(win, uri);
             g_free(uri);
         }
         return g_strdup("ok");
     }
     if (strcmp(cmd, "list") == 0) {
-        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-        int n = gtk_notebook_get_n_pages(nb);
+        GtkNotebook *nb = win ? GTK_NOTEBOOK(win->notebook) : NULL;
+        int n = nb ? gtk_notebook_get_n_pages(nb) : 0;
         GString *s = g_string_new(NULL);
         for (int i = 0; i < n; i++) {
             GtkWidget *page = gtk_notebook_get_nth_page(nb, i);
@@ -2848,12 +3056,12 @@ static char *handle_control_command(Browser *b, const char *cmd)
         return g_string_free(s, FALSE);
     }
     if (strcmp(cmd, "url") == 0) {
-        Tab *tab = current_tab(b);
+        Tab *tab = win ? current_tab(win) : NULL;
         const char *uri = tab ? webkit_web_view_get_uri(tab->view) : NULL;
         return g_strdup(uri ? uri : "");
     }
     if (strcmp(cmd, "title") == 0) {
-        Tab *tab = current_tab(b);
+        Tab *tab = win ? current_tab(win) : NULL;
         const char *title = tab ? webkit_web_view_get_title(tab->view) : NULL;
         return g_strdup(title ? title : "");
     }
@@ -2863,17 +3071,21 @@ static char *handle_control_command(Browser *b, const char *cmd)
     }
     if (g_str_has_prefix(cmd, "focus ")) {
         int n = atoi(cmd + 6);
-        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-        if (n >= 0 && n < gtk_notebook_get_n_pages(nb))
-            gtk_notebook_set_current_page(nb, n);
+        if (win) {
+            GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+            if (n >= 0 && n < gtk_notebook_get_n_pages(nb))
+                gtk_notebook_set_current_page(nb, n);
+        }
         return g_strdup("ok");
     }
     if (strcmp(cmd, "close") == 0 || g_str_has_prefix(cmd, "close ")) {
-        GtkNotebook *nb = GTK_NOTEBOOK(b->notebook);
-        int n = (cmd[5] == '\0') ? gtk_notebook_get_current_page(nb) : atoi(cmd + 6);
-        if (n >= 0 && n < gtk_notebook_get_n_pages(nb)) {
-            GtkWidget *page = gtk_notebook_get_nth_page(nb, n);
-            close_tab(b, page);
+        if (win) {
+            GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+            int n = (cmd[5] == '\0') ? gtk_notebook_get_current_page(nb) : atoi(cmd + 6);
+            if (n >= 0 && n < gtk_notebook_get_n_pages(nb)) {
+                GtkWidget *page = gtk_notebook_get_nth_page(nb, n);
+                close_tab(win, page);
+            }
         }
         return g_strdup("ok");
     }
@@ -2916,8 +3128,51 @@ static gboolean on_control_connected(GSocketService *service, GSocketConnection 
 
 /* ---------- window / cleanup ---------- */
 
-static void on_destroy(GtkWidget *w, Browser *b)
+/* The focused window, or the most recent one if none is tracked yet. */
+static Win *active_window(Browser *b)
 {
+    if (b->active)
+        return b->active;
+    return (b->windows && b->windows->len)
+        ? g_ptr_array_index(b->windows, b->windows->len - 1) : NULL;
+}
+
+/* The active window's toplevel, or NULL if none: the parent for modal
+ * dialogs. */
+static GtkWidget *win_toplevel(Browser *b)
+{
+    Win *w = active_window(b);
+    return w ? w->window : NULL;
+}
+
+static void on_window_focus_in(GtkWidget *w, GdkEvent *e, Win *win)
+{
+    (void)w; (void)e;
+    win->browser->active = win;
+}
+
+static void close_window(Win *win)
+{
+    /* destroying the toplevel fires "destroy" -> on_window_destroy, which
+     * detaches the window from the app and quits when it is the last one */
+    gtk_widget_destroy(win->window);
+}
+
+/* A window's toplevel went away: drop it from the app, and shut the whole
+ * browser down if it was the last one. */
+static void on_window_destroy(GtkWidget *w, Win *win)
+{
+    Browser *b = win->browser;
+    (void)w;
+    if (b->active == win)
+        b->active = NULL;
+    g_ptr_array_remove(b->windows, win);
+    g_free(win);
+    if (b->windows->len > 0) {
+        b->active = g_ptr_array_index(b->windows, b->windows->len - 1);
+        return;
+    }
+    /* last window closed: tear down the whole app */
     if (b->control_service) {
         g_socket_service_stop(b->control_service);
         g_object_unref(b->control_service);
@@ -2957,7 +3212,6 @@ static void on_destroy(GtkWidget *w, Browser *b)
         g_ptr_array_unref(b->bookmarks);
         b->bookmarks = NULL;
     }
-
     if (b->closed_tabs) {
         for (guint i = 0; i < b->closed_tabs->len; i++) {
             ClosedTab *ct = g_ptr_array_index(b->closed_tabs, i);
@@ -2968,7 +3222,168 @@ static void on_destroy(GtkWidget *w, Browser *b)
         g_ptr_array_unref(b->closed_tabs);
         b->closed_tabs = NULL;
     }
+    g_free(b);
     gtk_main_quit();
+}
+
+/* Build a fresh browser window (toplevel + toolbar + notebook + find bar).
+ * Tabs are added afterwards via new_tab(). */
+static Win *new_window(Browser *b)
+{
+    Win *win = g_new0(Win, 1);
+    win->browser = b;
+
+    win->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win->window), APP_NAME);
+    gtk_window_set_default_size(GTK_WINDOW(win->window), 1100, 700);
+    /* drops on the toolbar / tab strip open the link or file in a new
+     * tab; drops on the web view are handled by the per-view fallback */
+    gtk_drag_dest_set(win->window, GTK_DEST_DEFAULT_ALL,
+                      WINDOW_DROP_TARGETS, G_N_ELEMENTS(WINDOW_DROP_TARGETS),
+                      GDK_ACTION_COPY);
+    g_signal_connect(win->window, "drag-data-received",
+                     G_CALLBACK(on_window_drag_data_received), win);
+    g_signal_connect(win->window, "destroy", G_CALLBACK(on_window_destroy), win);
+    g_signal_connect(win->window, "focus-in-event", G_CALLBACK(on_window_focus_in), win);
+    g_signal_connect(win->window, "key-press-event", G_CALLBACK(on_key_press), win);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(win->window), vbox);
+
+    /* toolbar */
+    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_style_context_add_class(gtk_widget_get_style_context(toolbar), "toolbar");
+    gtk_container_set_border_width(GTK_CONTAINER(toolbar), 4);
+
+    win->back_button = gtk_button_new_from_icon_name("go-previous", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    win->forward_button = gtk_button_new_from_icon_name("go-next", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    win->reload_button = gtk_button_new_from_icon_name("view-refresh", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_widget_set_sensitive(win->back_button, FALSE);
+    gtk_widget_set_sensitive(win->forward_button, FALSE);
+    gtk_widget_set_tooltip_text(win->back_button, "Back");
+    gtk_widget_set_tooltip_text(win->forward_button, "Forward");
+    gtk_widget_set_tooltip_text(win->reload_button, "Reload / Stop (F5)");
+
+    win->url_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(win->url_entry), "Search or enter address");
+    gtk_widget_set_hexpand(win->url_entry, TRUE);
+    gtk_widget_set_tooltip_text(win->url_entry, "Ctrl+L to focus");
+    GtkEntryCompletion *completion = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(b->url_model));
+    gtk_entry_completion_set_text_column(completion, 0);
+    gtk_entry_completion_set_minimum_key_length(completion, 2);
+    gtk_entry_set_completion(GTK_ENTRY(win->url_entry), completion);
+
+    GtkWidget *settings_button = gtk_button_new_from_icon_name("preferences-system",
+                                                               GTK_ICON_SIZE_LARGE_TOOLBAR);
+    GtkWidget *new_tab_button = gtk_button_new_from_icon_name("list-add", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    GtkWidget *close_tab_button = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_widget_set_tooltip_text(settings_button, "Settings");
+    gtk_widget_set_tooltip_text(new_tab_button, "New tab (Ctrl+T)");
+    gtk_widget_set_tooltip_text(close_tab_button, "Close tab (Ctrl+W)");
+
+    win->blocked_button = gtk_button_new();
+    {
+        GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        GtkWidget *bimg = gtk_image_new_from_icon_name("security-high",
+                                                       GTK_ICON_SIZE_SMALL_TOOLBAR);
+        win->blocked_label = gtk_label_new("0");
+        gtk_box_pack_start(GTK_BOX(bb), bimg, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(bb), win->blocked_label, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(win->blocked_button), bb);
+    }
+    gtk_widget_set_tooltip_text(win->blocked_button,
+                                "Trackers blocked — click for details");
+    g_signal_connect(win->blocked_button, "clicked",
+                     G_CALLBACK(on_blocked_clicked), b);
+
+    gtk_box_pack_start(GTK_BOX(toolbar), win->back_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->forward_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->reload_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->url_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->blocked_button, FALSE, FALSE, 0);
+
+    win->kp_fill_button = gtk_button_new_from_icon_name("dialog-password",
+                                                      GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_widget_set_tooltip_text(win->kp_fill_button,
+                                "Fill login form from KeePass (Ctrl+Shift+L)");
+    g_signal_connect(win->kp_fill_button, "clicked",
+                     G_CALLBACK(on_fill_button_clicked), b);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->kp_fill_button, FALSE, FALSE, 0);
+
+    win->bookmarks_button = gtk_button_new_from_icon_name("starred",
+                                                       GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_widget_set_tooltip_text(win->bookmarks_button,
+                                "Bookmarks — Ctrl+D toggles the current page");
+    g_signal_connect(win->bookmarks_button, "clicked",
+                     G_CALLBACK(on_bookmarks_clicked), b);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->bookmarks_button, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), close_tab_button, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
+
+    /* thin progress bar between the toolbar and the tabs */
+    win->progress = gtk_progress_bar_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(win->progress), "thin");
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(win->progress), 0);
+    gtk_box_pack_start(GTK_BOX(vbox), win->progress, FALSE, FALSE, 0);
+
+    win->notebook = gtk_notebook_new();
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(win->notebook), FALSE);
+    /* Scrollable so many tabs use arrows instead of forcing the window's
+     * minimum size to grow with each new tab. */
+    gtk_notebook_set_scrollable(GTK_NOTEBOOK(win->notebook), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), win->notebook, TRUE, TRUE, 0);
+
+    /* find-in-page bar (Ctrl+F), hidden until requested */
+    win->find_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(win->find_bar), 4);
+    gtk_box_pack_start(GTK_BOX(win->find_bar), gtk_label_new("Find:"), FALSE, FALSE, 0);
+    win->find_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(win->find_entry), "Find in page");
+    gtk_widget_set_tooltip_text(win->find_entry,
+                                "Enter next · Shift+Enter previous · Esc close");
+    gtk_box_pack_start(GTK_BOX(win->find_bar), win->find_entry, TRUE, TRUE, 0);
+    win->find_label = gtk_label_new("");
+    gtk_box_pack_start(GTK_BOX(win->find_bar), win->find_label, FALSE, FALSE, 0);
+    GtkWidget *find_prev_btn = gtk_button_new_from_icon_name("go-up", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(find_prev_btn, "Previous match");
+    GtkWidget *find_next_btn = gtk_button_new_from_icon_name("go-down", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(find_next_btn, "Next match");
+    GtkWidget *find_close_btn = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(find_close_btn, "Close (Esc)");
+    g_signal_connect(find_prev_btn, "clicked", G_CALLBACK(on_find_prev_clicked), win);
+    g_signal_connect(find_next_btn, "clicked", G_CALLBACK(on_find_next_clicked), win);
+    g_signal_connect(find_close_btn, "clicked", G_CALLBACK(on_find_close_clicked), win);
+    g_signal_connect(win->find_entry, "changed", G_CALLBACK(on_find_changed), win);
+    g_signal_connect(win->find_entry, "key-press-event", G_CALLBACK(on_find_key_press), win);
+    gtk_box_pack_start(GTK_BOX(win->find_bar), find_prev_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(win->find_bar), find_next_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(win->find_bar), find_close_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), win->find_bar, FALSE, FALSE, 0);
+
+    /* 0x0 stand-in tab label that hides the whole tab strip (single tab) */
+    win->empty_tab_label = gtk_label_new("");
+    gtk_widget_set_size_request(win->empty_tab_label, 0, 0);
+
+    g_signal_connect(win->back_button, "clicked", G_CALLBACK(on_back_clicked), win);
+    g_signal_connect(win->forward_button, "clicked", G_CALLBACK(on_forward_clicked), win);
+    g_signal_connect(win->reload_button, "clicked", G_CALLBACK(on_reload_clicked), win);
+    g_signal_connect(settings_button, "clicked", G_CALLBACK(on_settings_clicked), b);
+    g_signal_connect(new_tab_button, "clicked", G_CALLBACK(on_new_tab_clicked), win);
+    g_signal_connect(close_tab_button, "clicked", G_CALLBACK(on_close_tab_clicked), win);
+    g_signal_connect(win->url_entry, "activate", G_CALLBACK(on_entry_activate), win);
+    g_signal_connect(win->notebook, "switch-page", G_CALLBACK(on_switch_page), win);
+
+    g_ptr_array_add(b->windows, win);
+    b->active = win;
+    gtk_widget_show_all(win->window);
+    gtk_widget_hide(win->find_bar);
+    update_tabbar(win);
+    return win;
 }
 
 /* ---------- CSS ---------- */
@@ -3089,151 +3504,17 @@ int main(int argc, char *argv[])
     b->devtools_enabled = TRUE;
     b->default_zoom = 100;
     b->restore_session = TRUE;
+    b->hide_tabbar = TRUE;
     load_settings(b);
     load_history(b);
     load_bookmarks(b);
 
-    b->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(b->window), APP_NAME);
-    gtk_window_set_default_size(GTK_WINDOW(b->window), 1100, 700);
-    g_signal_connect(b->window, "destroy", G_CALLBACK(on_destroy), b);
-    g_signal_connect(b->window, "key-press-event", G_CALLBACK(on_key_press), b);
-    /* drops on the toolbar / tab strip open the link or file in a new
-     * tab; drops on the web view are handled by the per-view fallback */
-    gtk_drag_dest_set(b->window, GTK_DEST_DEFAULT_ALL,
-                      WINDOW_DROP_TARGETS, G_N_ELEMENTS(WINDOW_DROP_TARGETS),
-                      GDK_ACTION_COPY);
-    g_signal_connect(b->window, "drag-data-received",
-                     G_CALLBACK(on_window_drag_data_received), b);
-
-    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_container_add(GTK_CONTAINER(b->window), vbox);
-
-    /* toolbar */
-    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_style_context_add_class(gtk_widget_get_style_context(toolbar), "toolbar");
-    gtk_container_set_border_width(GTK_CONTAINER(toolbar), 4);
-
-    b->back_button = gtk_button_new_from_icon_name("go-previous", GTK_ICON_SIZE_LARGE_TOOLBAR);
-    b->forward_button = gtk_button_new_from_icon_name("go-next", GTK_ICON_SIZE_LARGE_TOOLBAR);
-    b->reload_button = gtk_button_new_from_icon_name("view-refresh", GTK_ICON_SIZE_LARGE_TOOLBAR);
-    gtk_widget_set_sensitive(b->back_button, FALSE);
-    gtk_widget_set_sensitive(b->forward_button, FALSE);
-    gtk_widget_set_tooltip_text(b->back_button, "Back");
-    gtk_widget_set_tooltip_text(b->forward_button, "Forward");
-    gtk_widget_set_tooltip_text(b->reload_button, "Reload / Stop (F5)");
-
-    b->url_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(b->url_entry), "Search or enter address");
-    gtk_widget_set_hexpand(b->url_entry, TRUE);
-    gtk_widget_set_tooltip_text(b->url_entry, "Ctrl+L to focus");
+    b->windows = g_ptr_array_new();
     b->url_model = gtk_list_store_new(1, G_TYPE_STRING);
-    GtkEntryCompletion *completion = gtk_entry_completion_new();
-    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(b->url_model));
-    gtk_entry_completion_set_text_column(completion, 0);
-    gtk_entry_completion_set_minimum_key_length(completion, 2);
-    gtk_entry_set_completion(GTK_ENTRY(b->url_entry), completion);
     refresh_url_model(b);
 
-    GtkWidget *settings_button = gtk_button_new_from_icon_name("preferences-system",
-                                                               GTK_ICON_SIZE_LARGE_TOOLBAR);
-    GtkWidget *new_tab_button = gtk_button_new_from_icon_name("list-add", GTK_ICON_SIZE_LARGE_TOOLBAR);
-    GtkWidget *close_tab_button = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_LARGE_TOOLBAR);
-    gtk_widget_set_tooltip_text(settings_button, "Settings");
-    gtk_widget_set_tooltip_text(new_tab_button, "New tab (Ctrl+T)");
-    gtk_widget_set_tooltip_text(close_tab_button, "Close tab (Ctrl+W)");
+    Win *w0 = new_window(b);
 
-    b->blocked_button = gtk_button_new();
-    {
-        GtkWidget *bb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-        GtkWidget *bimg = gtk_image_new_from_icon_name("security-high",
-                                                       GTK_ICON_SIZE_SMALL_TOOLBAR);
-        b->blocked_label = gtk_label_new("0");
-        gtk_box_pack_start(GTK_BOX(bb), bimg, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(bb), b->blocked_label, FALSE, FALSE, 0);
-        gtk_container_add(GTK_CONTAINER(b->blocked_button), bb);
-    }
-    gtk_widget_set_tooltip_text(b->blocked_button,
-                                "Trackers blocked — click for details");
-    g_signal_connect(b->blocked_button, "clicked",
-                     G_CALLBACK(on_blocked_clicked), b);
-
-    gtk_box_pack_start(GTK_BOX(toolbar), b->back_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->forward_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->reload_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->url_entry, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->blocked_button, FALSE, FALSE, 0);
-
-    b->kp_fill_button = gtk_button_new_from_icon_name("dialog-password",
-                                                      GTK_ICON_SIZE_SMALL_TOOLBAR);
-    gtk_widget_set_tooltip_text(b->kp_fill_button,
-                                "Fill login form from KeePass (Ctrl+Shift+L)");
-    g_signal_connect(b->kp_fill_button, "clicked",
-                     G_CALLBACK(on_fill_button_clicked), b);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->kp_fill_button, FALSE, FALSE, 0);
-
-    b->bookmarks_button = gtk_button_new_from_icon_name("starred",
-                                                       GTK_ICON_SIZE_LARGE_TOOLBAR);
-    gtk_widget_set_tooltip_text(b->bookmarks_button,
-                                "Bookmarks — Ctrl+D toggles the current page");
-    g_signal_connect(b->bookmarks_button, "clicked",
-                     G_CALLBACK(on_bookmarks_clicked), b);
-    gtk_box_pack_start(GTK_BOX(toolbar), b->bookmarks_button, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), close_tab_button, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(vbox), toolbar, FALSE, FALSE, 0);
-
-    /* thin progress bar between the toolbar and the tabs */
-    b->progress = gtk_progress_bar_new();
-    gtk_style_context_add_class(gtk_widget_get_style_context(b->progress), "thin");
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(b->progress), 0);
-    gtk_box_pack_start(GTK_BOX(vbox), b->progress, FALSE, FALSE, 0);
-
-    b->notebook = gtk_notebook_new();
-    gtk_notebook_set_show_border(GTK_NOTEBOOK(b->notebook), FALSE);
-    /* Scrollable so many tabs use arrows instead of forcing the window's
-     * minimum size to grow with each new tab. */
-    gtk_notebook_set_scrollable(GTK_NOTEBOOK(b->notebook), TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), b->notebook, TRUE, TRUE, 0);
-
-    /* find-in-page bar (Ctrl+F), hidden until requested */
-    b->find_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_container_set_border_width(GTK_CONTAINER(b->find_bar), 4);
-    gtk_box_pack_start(GTK_BOX(b->find_bar), gtk_label_new("Find:"), FALSE, FALSE, 0);
-    b->find_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(b->find_entry), "Find in page");
-    gtk_widget_set_tooltip_text(b->find_entry,
-                                "Enter next · Shift+Enter previous · Esc close");
-    gtk_box_pack_start(GTK_BOX(b->find_bar), b->find_entry, TRUE, TRUE, 0);
-    b->find_label = gtk_label_new("");
-    gtk_box_pack_start(GTK_BOX(b->find_bar), b->find_label, FALSE, FALSE, 0);
-    GtkWidget *find_prev_btn = gtk_button_new_from_icon_name("go-up", GTK_ICON_SIZE_BUTTON);
-    gtk_widget_set_tooltip_text(find_prev_btn, "Previous match");
-    GtkWidget *find_next_btn = gtk_button_new_from_icon_name("go-down", GTK_ICON_SIZE_BUTTON);
-    gtk_widget_set_tooltip_text(find_next_btn, "Next match");
-    GtkWidget *find_close_btn = gtk_button_new_from_icon_name("window-close", GTK_ICON_SIZE_BUTTON);
-    gtk_widget_set_tooltip_text(find_close_btn, "Close (Esc)");
-    g_signal_connect(find_prev_btn, "clicked", G_CALLBACK(on_find_prev_clicked), b);
-    g_signal_connect(find_next_btn, "clicked", G_CALLBACK(on_find_next_clicked), b);
-    g_signal_connect(find_close_btn, "clicked", G_CALLBACK(on_find_close_clicked), b);
-    g_signal_connect(b->find_entry, "changed", G_CALLBACK(on_find_changed), b);
-    g_signal_connect(b->find_entry, "key-press-event", G_CALLBACK(on_find_key_press), b);
-    gtk_box_pack_start(GTK_BOX(b->find_bar), find_prev_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(b->find_bar), find_next_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(b->find_bar), find_close_btn, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), b->find_bar, FALSE, FALSE, 0);
-
-    g_signal_connect(b->back_button, "clicked", G_CALLBACK(on_back_clicked), b);
-    g_signal_connect(b->forward_button, "clicked", G_CALLBACK(on_forward_clicked), b);
-    g_signal_connect(b->reload_button, "clicked", G_CALLBACK(on_reload_clicked), b);
-    g_signal_connect(settings_button, "clicked", G_CALLBACK(on_settings_clicked), b);
-    g_signal_connect(new_tab_button, "clicked", G_CALLBACK(on_new_tab_clicked), b);
-    g_signal_connect(close_tab_button, "clicked", G_CALLBACK(on_close_tab_clicked), b);
-    g_signal_connect(b->url_entry, "activate", G_CALLBACK(on_entry_activate), b);
-    g_signal_connect(b->notebook, "switch-page", G_CALLBACK(on_switch_page), b);
     g_signal_connect(webkit_web_context_get_default(), "download-started",
                      G_CALLBACK(on_download_started), b);
 
@@ -3259,14 +3540,12 @@ int main(int argc, char *argv[])
     g_clear_object(&caddr);
 
     /* first tab: URL from the command line, or the last session, or home */
-    if (initial || !b->restore_session || !session_restore(b))
-        new_tab(b, initial);
+    if (initial || !b->restore_session || !session_restore(b, w0))
+        new_tab(w0, initial);
 
     update_blocked_label(b);
     g_timeout_add(1000, update_blocked_label, b);
 
-    gtk_widget_show_all(b->window);
-    gtk_widget_hide(b->find_bar);
     gtk_main();
     return 0;
 }
