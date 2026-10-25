@@ -75,6 +75,21 @@ typedef struct Tab Tab;
 typedef struct Browser Browser;
 typedef struct Win Win;
 
+/* Configurable keyboard shortcut: the keyval plus the modifier mask
+ * (Ctrl / Alt / Shift). keyval 0 means the shortcut is disabled. */
+typedef struct { guint keyval; GdkModifierType mods; } ScKey;
+
+/* Actions offered in the shortcut manager (Settings → Manage shortcuts).
+ * Order matters: on a conflict the earlier action wins. */
+typedef enum {
+    SC_BACK, SC_FORWARD, SC_RELOAD, SC_FULLSCREEN,
+    SC_NEW_TAB, SC_CLOSE_TAB, SC_REOPEN_TAB, SC_FOCUS_URL,
+    SC_HOME, SC_FIND, SC_BOOKMARK, SC_SOURCE, SC_SAVE_PAGE,
+    SC_ZOOM_IN, SC_ZOOM_OUT, SC_ZOOM_RESET,
+    SC_FILL_LOGIN, SC_CYCLE_NEXT, SC_CYCLE_PREV,
+    SC_N_ACTIONS
+} ShortcutAction;
+
 /* App-level state, one per process: shared across every window. */
 struct Browser {
     GPtrArray *windows;      /* Win*, most recent last */
@@ -103,6 +118,16 @@ struct Browser {
     gboolean hide_tabbar;    /* hide the tab strip in single-tab windows */
     gboolean block_third_party; /* reject cookies set by third-party sites */
     GHashTable *visited_hosts;  /* top-level hosts visited; flags shared cookies */
+    /* downloads manager */
+    GPtrArray *downloads;       /* DlItem*, newest last */
+    GtkListStore *downloads_model; /* rows for the downloads window */
+    GtkWidget *downloads_window;   /* NULL until first opened */
+    gchar *download_dir;          /* auto-save folder; NULL = XDG default */
+    gboolean download_ask;        /* ask for a destination for each file */
+    /* site permissions ("origin|name" -> "granted" / "denied") */
+    GHashTable *permissions;
+    /* keyboard shortcuts (one ScKey per ShortcutAction) */
+    ScKey sc[SC_N_ACTIONS];
 };
 
 /* Per-window state: the toplevel and everything that lives inside it. */
@@ -119,6 +144,7 @@ struct Win {
     GtkWidget *blocked_label;
     GtkWidget *kp_fill_button;
     GtkWidget *bookmarks_button;
+    GtkWidget *downloads_button;
     Tab *find_tab;           /* tab whose find controller is active */
     GtkWidget *find_bar;     /* Ctrl+F bar, hidden by default */
     GtkWidget *find_entry;
@@ -147,6 +173,12 @@ typedef struct Tab {
     guint drop_timer;             /* fallback-delay source id, 0 = none */
     guint drop_leave_timer;       /* leave-vs-drop resolver id, 0 = none */
     guint drop_status_timer;      /* COPY re-assert id, 0 = none */
+    /* set by the "query-permission-state" handler when WebKit asks to
+     * prompt the user: the canonical name and origin the question is
+     * about, so the later "permission-request" can store the decision
+     * under the same key WebKit will query again */
+    gchar *perm_pending_name;
+    gchar *perm_pending_origin;
 } Tab;
 
 typedef struct {
@@ -221,6 +253,13 @@ static void on_restore_toggled(GtkToggleButton *btn, Browser *b);
 static void on_hide_tabbar_toggled(GtkToggleButton *btn, Browser *b);
 static void on_manage_history_clicked(GtkButton *btn, Browser *b);
 static void on_manage_cookies_clicked(GtkButton *btn, Browser *b);
+static void on_manage_permissions_clicked(GtkButton *btn, Browser *b);
+static void on_manage_shortcuts_clicked(GtkButton *btn, Browser *b);
+static void on_download_ask_toggled(GtkToggleButton *btn, Browser *b);
+static void on_download_dir_changed(GtkEntry *entry, Browser *b);
+static void on_download_dir_browse(GtkButton *btn, Browser *b);
+static void sc_load(Browser *b, GKeyFile *kf);
+static void sc_save(Browser *b, GKeyFile *kf);
 static void on_block_third_party_toggled(GtkToggleButton *btn, Browser *b);
 static void apply_cookie_policy(Browser *b);
 static void history_save(Browser *b);
@@ -897,6 +936,8 @@ static void tab_destroy(Tab *tab)
 {
     tab_drop_cancel(tab);
     drop_source_file(tab, NULL);
+    g_free(tab->perm_pending_name);
+    g_free(tab->perm_pending_origin);
     g_clear_object(&tab->tab_label);
     g_free(tab);
 }
@@ -928,6 +969,13 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab
         webkit_find_controller_search_finish(
             webkit_web_view_get_find_controller(view));
         win->find_tab = NULL;
+    }
+    if (event == WEBKIT_LOAD_STARTED) {
+        /* a pending permission prompt belongs to the previous page */
+        g_free(tab->perm_pending_name);
+        g_free(tab->perm_pending_origin);
+        tab->perm_pending_name = NULL;
+        tab->perm_pending_origin = NULL;
     }
     if (current_tab(win) == tab) {
         update_url_entry(win, tab);
@@ -1030,33 +1078,913 @@ static void on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision
     webkit_policy_decision_use(decision);
 }
 
+/* ---------- downloads manager ----------
+ *
+ * Every download gets a row in a global list (toolbar button → window):
+ * live progress, then Done / Failed / Canceled with the final size. Files
+ * are saved to the configured download folder (default: XDG "Downloads")
+ * unless "ask where to save" is on, in which case a save dialog is shown
+ * first, like before. WebKitDownload exposes no completion or failure
+ * signal in this WebKit build: progress reaches 1.0 when a download
+ * succeeds, and an active download that makes no progress for a while is
+ * marked failed by a periodic check. */
+
+typedef enum { DL_ACTIVE, DL_DONE, DL_FAILED, DL_CANCELED } DlState;
+
+typedef struct {
+    Browser *b;              /* back-pointer (the item outlives the download) */
+    WebKitDownload *dl;      /* strong ref, unref'd on "destroy" */
+    char *name;              /* display filename */
+    char *dest_path;
+    char *dest_uri;
+    guint64 received;
+    gdouble progress;        /* 0..1 from estimated-progress */
+    gint64 last_ms;          /* last progress activity (stall detection) */
+    DlState state;
+    gboolean canceled;       /* we canceled it (user / save-dialog veto) */
+    GtkTreeIter row;         /* row in b->downloads_model */
+} DlItem;
+
+/* model columns: item ptr, icon name, filename, status text */
+#define DL_COL_ITEM 0
+#define DL_COL_ICON 1
+#define DL_COL_NAME 2
+#define DL_COL_STATUS 3
+
+static void dl_update_row(DlItem *it);
+static void on_dl_progress_notify(WebKitDownload *dl, GParamSpec *ps, gpointer data);
+static void on_dl_received_notify(WebKitDownload *dl, GParamSpec *ps, gpointer data);
+
+static char *dl_human_size(guint64 n)
+{
+    if (n < 1024)
+        return g_strdup_printf("%" G_GUINT64_FORMAT " B", n);
+    double v = (double)n;
+    const char *u;
+    if (v < 1024 * 1024)        { v /= 1024;          u = "KB"; }
+    else if (v < 1024.0 * 1024) { v /= 1024 * 1024;   u = "MB"; }
+    else if (v < 1024.0 * 1024 * 1024) { v /= 1024.0 * 1024 * 1024; u = "GB"; }
+    else                         { v /= 1024.0 * 1024 * 1024; u = "TB"; }
+    return g_strdup_printf("%.1f %s", v, u);
+}
+
+static void dl_update_row(DlItem *it)
+{
+    Browser *b = it->b;
+    const char *icon;
+    char *status;
+    switch (it->state) {
+    case DL_ACTIVE:
+        icon = "download";
+        if (it->progress > 0)
+            status = g_strdup_printf("%.0f%% · %s", it->progress * 100,
+                                     dl_human_size(it->received));
+        else
+            status = g_strdup("Starting…");
+        break;
+    case DL_DONE:
+        icon = "emblem-ok";
+        status = g_strdup(dl_human_size(it->received));
+        break;
+    case DL_FAILED:
+        icon = "dialog-error";
+        status = g_strdup("Failed");
+        break;
+    case DL_CANCELED:
+    default:
+        icon = "process-stop";
+        status = g_strdup("Canceled");
+        break;
+    }
+    gtk_list_store_set(b->downloads_model, &it->row,
+                       DL_COL_ICON, icon,
+                       DL_COL_NAME, it->name,
+                       DL_COL_STATUS, status, -1);
+    g_free(status);
+}
+
+/* Folder for auto-saved files: the configured one, else XDG_DOWNLOAD_DIR,
+ * else ~/Downloads (created if missing). */
+static char *dl_auto_dir(Browser *b)
+{
+    const char *env = g_getenv("XDG_DOWNLOAD_DIR");
+    if (b->download_dir && *b->download_dir)
+        return g_strdup(b->download_dir);
+    if (env && *env)
+        return g_strdup(env);
+    return g_build_filename(g_get_home_dir(), "Downloads", NULL);
+}
+
+/* <dir>/<name>, with " (n)" appended until the name is free. */
+static char *dl_auto_path(Browser *b, const char *name)
+{
+    char *dir = dl_auto_dir(b);
+    g_mkdir_with_parents(dir, 0755);
+    char *p;
+    for (int i = 0; ; i++) {
+        p = (i == 0) ? g_strdup_printf("%s/%s", dir, name)
+                     : g_strdup_printf("%s/%s (%d)", dir, name, i);
+        if (!g_file_test(p, G_FILE_TEST_EXISTS))
+            break;
+        g_free(p);
+    }
+    g_free(dir);
+    return p;
+}
+
+static void on_downloads_window_destroy(GtkWidget *w, Browser *b);
+static void dl_window_open(Browser *b);
+static void on_dl_open_clicked(GtkButton *btn, Browser *b);
+static void on_dl_folder_clicked(GtkButton *btn, Browser *b);
+static void on_dl_cancel_clicked(GtkButton *btn, Browser *b);
+static void on_dl_remove_clicked(GtkButton *btn, Browser *b);
+static void on_dl_clear_clicked(GtkButton *btn, Browser *b);
+
+/* Toolbar button: open the downloads window. */
+static void on_downloads_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    dl_window_open(b);
+}
+
+/* Open the downloads window (created on first use). */
+static void dl_window_open(Browser *b)
+{
+    if (!b->downloads_window) {
+        GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win), "Downloads");
+        gtk_window_set_default_size(GTK_WINDOW(win), 720, 420);
+        gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(win_toplevel(b)));
+
+        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        gtk_container_set_border_width(GTK_CONTAINER(vbox), 8);
+        gtk_container_add(GTK_CONTAINER(win), vbox);
+
+        GtkWidget *tv = gtk_tree_view_new_with_model(GTK_TREE_MODEL(b->downloads_model));
+        GtkCellRenderer *ri = gtk_cell_renderer_pixbuf_new();
+        gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tv), -1,
+                                                    "", ri, "icon-name", DL_COL_ICON, NULL);
+        GtkCellRenderer *rn = gtk_cell_renderer_text_new();
+        gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(tv), -1,
+                                                    "File", rn, "text", DL_COL_NAME, NULL);
+        /* this build's append_column returns a 1-based position, so the "File"
+         * column (second) is view index 1 for get_column() */
+        gtk_tree_view_column_set_expand(gtk_tree_view_get_column(GTK_TREE_VIEW(tv), 1), TRUE);
+        GtkCellRenderer *rs = gtk_cell_renderer_text_new();
+        gtk_tree_view_append_column(GTK_TREE_VIEW(tv),
+            gtk_tree_view_column_new_with_attributes("Status", rs, "text", DL_COL_STATUS, NULL));
+        gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(tv)),
+                                    GTK_SELECTION_BROWSE);
+        GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+        gtk_container_add(GTK_CONTAINER(sw), tv);
+        gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        GtkWidget *open_btn = gtk_button_new_with_label("_Open");
+        gtk_widget_set_tooltip_text(open_btn, "Open the selected file");
+        GtkWidget *folder_btn = gtk_button_new_with_label("Show in _Folder");
+        gtk_widget_set_tooltip_text(folder_btn, "Open the folder containing the selected file");
+        GtkWidget *cancel_btn = gtk_button_new_with_label("Can_cell");
+        gtk_widget_set_tooltip_text(cancel_btn, "Cancel the selected running download");
+        GtkWidget *remove_btn = gtk_button_new_with_label("Re_move");
+        gtk_widget_set_tooltip_text(remove_btn, "Remove the selected row from the list");
+        GtkWidget *clear_btn = gtk_button_new_with_label("Clear _finished");
+        gtk_widget_set_tooltip_text(clear_btn, "Remove all finished rows");
+        g_object_set_data(G_OBJECT(open_btn), "tv", tv);
+        g_object_set_data(G_OBJECT(folder_btn), "tv", tv);
+        g_object_set_data(G_OBJECT(cancel_btn), "tv", tv);
+        g_object_set_data(G_OBJECT(remove_btn), "tv", tv);
+        g_signal_connect(open_btn, "clicked", G_CALLBACK(on_dl_open_clicked), b);
+        g_signal_connect(folder_btn, "clicked", G_CALLBACK(on_dl_folder_clicked), b);
+        g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_dl_cancel_clicked), b);
+        g_signal_connect(remove_btn, "clicked", G_CALLBACK(on_dl_remove_clicked), b);
+        g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_dl_clear_clicked), b);
+        gtk_box_pack_start(GTK_BOX(row), open_btn, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), folder_btn, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), cancel_btn, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), remove_btn, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), clear_btn, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), row, FALSE, FALSE, 0);
+
+        g_signal_connect(win, "destroy", G_CALLBACK(on_downloads_window_destroy), b);
+        gtk_widget_show_all(win);
+        b->downloads_window = win;
+    }
+    gtk_window_present(GTK_WINDOW(b->downloads_window));
+}
+
+static void on_downloads_window_destroy(GtkWidget *w, Browser *b)
+{
+    (void)w;
+    b->downloads_window = NULL;
+}
+
+/* The selected row's item, or NULL. */
+static DlItem *dl_selected(GtkTreeView *tv)
+{
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(tv);
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter))
+        return NULL;
+    gpointer item;
+    gtk_tree_model_get(model, &iter, DL_COL_ITEM, &item, -1);
+    return item;
+}
+
+static void on_dl_open_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    DlItem *it = dl_selected(g_object_get_data(G_OBJECT(btn), "tv"));
+    if (it && it->state == DL_DONE && it->dest_uri)
+        g_app_info_launch_default_for_uri(it->dest_uri, NULL, NULL);
+}
+
+static void on_dl_folder_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    DlItem *it = dl_selected(g_object_get_data(G_OBJECT(btn), "tv"));
+    if (!it || !it->dest_path)
+        return;
+    char *dir = g_path_get_dirname(it->dest_path);
+    char *uri = g_filename_to_uri(dir, NULL, NULL);
+    if (uri) {
+        g_app_info_launch_default_for_uri(uri, NULL, NULL);
+        g_free(uri);
+    }
+    g_free(dir);
+}
+
+static void on_dl_cancel_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    DlItem *it = dl_selected(g_object_get_data(G_OBJECT(btn), "tv"));
+    if (it && it->state == DL_ACTIVE && it->dl) {
+        it->canceled = TRUE;
+        it->state = DL_CANCELED;
+        dl_update_row(it);
+        webkit_download_cancel(it->dl);
+    }
+}
+
+static void dl_remove_row(Browser *b, DlItem *it)
+{
+    if (it->state == DL_ACTIVE && it->dl) {
+        it->canceled = TRUE;
+        webkit_download_cancel(it->dl);
+    }
+    gtk_list_store_remove(b->downloads_model, &it->row);
+    g_ptr_array_remove(b->downloads, it);
+}
+
+static void on_dl_remove_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    DlItem *it = dl_selected(g_object_get_data(G_OBJECT(btn), "tv"));
+    if (it)
+        dl_remove_row(b, it);
+}
+
+static void on_dl_clear_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    for (guint i = 0; i < b->downloads->len; ) {
+        DlItem *it = g_ptr_array_index(b->downloads, i);
+        if (it->state != DL_ACTIVE)
+            dl_remove_row(b, it);
+        else
+            i++;
+    }
+}
+
+/* The download object went away: it finished, failed, or was canceled.
+ * The file on disk tells us which (a canceled download writes nothing). */
+/* WebKitDownload has no terminal signal: an active download that makes no
+ * progress for a while has failed (success reaches 1.0 and is handled in
+ * the progress notify; canceled ones are flagged by us and skipped). */
+static gboolean on_dl_stall_check(gpointer data)
+{
+    Browser *b = data;
+    gint64 now = g_get_monotonic_time() / 1000;
+    for (guint i = 0; i < b->downloads->len; i++) {
+        DlItem *it = g_ptr_array_index(b->downloads, i);
+        if (it->state != DL_ACTIVE || it->canceled || it->progress >= 1.0)
+            continue;
+        gint64 limit = it->received > 0 ? 20000 : 60000;
+        if (now - it->last_ms > limit) {
+            it->state = DL_FAILED;
+            dl_update_row(it);
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+/* A WebKitDownload started: register it in the manager, pick its
+ * destination (save dialog or the download folder), and start it. */
 static void on_download_started(WebKitWebContext *context, WebKitDownload *download, Browser *b)
 {
+    (void)context;
     WebKitURIRequest *request = webkit_download_get_request(download);
     const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
-    const char *suggested = uri ? g_path_get_basename(uri) : "download";
-
-    Win *aw = active_window(b);
-    GtkWidget *dialog = gtk_file_chooser_dialog_new("Save file",
-                                                    aw ? GTK_WINDOW(aw->window) : NULL,
-                                                    GTK_FILE_CHOOSER_ACTION_SAVE,
-                                                    "_Cancel", GTK_RESPONSE_CANCEL,
-                                                    "_Save", GTK_RESPONSE_ACCEPT,
-                                                    NULL);
-    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), suggested);
-
-    int response = gtk_dialog_run(GTK_DIALOG(dialog));
-    if (response == GTK_RESPONSE_ACCEPT) {
-        char *save_uri = gtk_file_chooser_get_uri(GTK_FILE_CHOOSER(dialog));
-        if (save_uri) {
-            webkit_download_set_destination(download, save_uri);
-            g_free(save_uri);
-        } else {
-            webkit_download_cancel(download);
-        }
-    } else {
-        webkit_download_cancel(download);
+    char *suggested = uri ? g_uri_unescape_string(g_path_get_basename(uri), NULL)
+                          : g_strdup("download");
+    if (!*suggested) {
+        g_free(suggested);
+        suggested = g_strdup("download");
     }
+
+    DlItem *it = g_new0(DlItem, 1);
+    it->b = b;
+    it->dl = g_object_ref(download);
+    it->name = suggested;
+
+    if (b->download_ask) {
+        /* save dialog, as before */
+        GtkWidget *dialog = gtk_file_chooser_dialog_new("Save file",
+                                                        GTK_WINDOW(win_toplevel(b)),
+                                                        GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                        "_Cancel", GTK_RESPONSE_CANCEL,
+                                                        "_Save", GTK_RESPONSE_ACCEPT,
+                                                        NULL);
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), suggested);
+        if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+            char *save_uri = gtk_file_chooser_get_uri(GTK_FILE_CHOOSER(dialog));
+            if (save_uri) {
+                it->dest_uri = save_uri;
+                it->dest_path = g_filename_from_uri(save_uri, NULL, NULL);
+            } else {
+                it->canceled = TRUE;
+            }
+        } else {
+            it->canceled = TRUE;
+        }
+        gtk_widget_destroy(dialog);
+    } else {
+        it->dest_path = dl_auto_path(b, suggested);
+        it->dest_uri = g_filename_to_uri(it->dest_path, NULL, NULL);
+    }
+
+    g_ptr_array_add(b->downloads, it);
+    gtk_list_store_append(b->downloads_model, &it->row);
+    gtk_list_store_set(b->downloads_model, &it->row, DL_COL_ITEM, it, -1);
+    dl_update_row(it);
+
+    if (it->canceled) {
+        it->state = DL_CANCELED;
+        dl_update_row(it);
+        webkit_download_cancel(it->dl);
+        g_clear_object(&it->dl); /* the vetoed item keeps no live download */
+    } else {
+        g_signal_connect(it->dl, "notify::estimated-progress",
+                         G_CALLBACK(on_dl_progress_notify), it);
+        g_signal_connect(it->dl, "notify::received-data-length",
+                         G_CALLBACK(on_dl_received_notify), it);
+        it->last_ms = g_get_monotonic_time() / 1000;
+        webkit_download_set_destination(it->dl, it->dest_uri);
+    }
+    dl_window_open(b);
+}
+
+static void on_dl_progress_notify(WebKitDownload *dl, GParamSpec *ps, gpointer data)
+{
+    (void)ps;
+    DlItem *it = data;
+    it->progress = webkit_download_get_estimated_progress(dl);
+    it->received = webkit_download_get_received_data_length(dl);
+    it->last_ms = g_get_monotonic_time() / 1000;
+    if (it->state == DL_ACTIVE && it->progress >= 1.0)
+        it->state = DL_DONE; /* file is written; progress stops at 1.0 */
+    dl_update_row(it);
+}
+
+static void on_dl_received_notify(WebKitDownload *dl, GParamSpec *ps, gpointer data)
+{
+    (void)ps;
+    DlItem *it = data;
+    it->received = webkit_download_get_received_data_length(dl);
+    it->last_ms = g_get_monotonic_time() / 1000;
+    dl_update_row(it);
+}
+
+/* ---------- site permissions ----------
+ *
+ * WebKit asks twice about a permission: first a "query-permission-state"
+ * (what did the user decide before — we answer from our own persisted
+ * store) and, if we answer PROMPT, a "permission-request" which we answer
+ * with a dialog. The store is "origin|name" -> granted/denied, persisted
+ * in the data dir. The request object does not carry the origin in this
+ * WebKit build, so the origin is taken from the matching state query when
+ * one preceded the request (it always does when a stored decision exists)
+ * or from the view's current URI otherwise. */
+
+static char *perm_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "gtkbrowser",
+                            "permissions", NULL);
+}
+
+static void perm_load(Browser *b)
+{
+    b->permissions = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    char *path = perm_path();
+    gchar *contents = NULL;
+    if (g_file_get_contents(path, &contents, NULL, NULL)) {
+        gchar **lines = g_strsplit(contents, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            if (!*lines[i])
+                continue;
+            char **f = g_strsplit(lines[i], "\t", 3);
+            if (g_strv_length(f) == 3 &&
+                (g_strcmp0(f[2], "granted") == 0 || g_strcmp0(f[2], "denied") == 0)) {
+                char *key = g_strdup_printf("%s|%s", f[0], f[1]);
+                g_hash_table_replace(b->permissions, key, g_strdup(f[2]));
+            }
+            g_strfreev(f);
+        }
+        g_strfreev(lines);
+        g_free(contents);
+    }
+    g_free(path);
+}
+
+static void perm_save(Browser *b)
+{
+    GString *s = g_string_new(NULL);
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, b->permissions);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        const char *key = k;
+        char *p = g_strdup(key);
+        char *bar = strchr(p, '|');
+        if (bar && bar[1])
+            g_string_append_printf(s, "%s\t%s\t%s\n", p, bar + 1, (const char *)v);
+        g_free(p);
+    }
+    char *path = perm_path();
+    g_file_set_contents(path, s->str, s->len, NULL);
+    g_free(path);
+    g_string_free(s, TRUE);
+}
+
+static const char *perm_lookup(Browser *b, const char *origin, const char *name)
+{
+    if (!b->permissions || !origin || !*origin || !name || !*name)
+        return NULL;
+    char *key = g_strdup_printf("%s|%s", origin, name);
+    const char *v = g_hash_table_lookup(b->permissions, key);
+    g_free(key);
+    return v;
+}
+
+static void perm_set(Browser *b, const char *origin, const char *name,
+                     const char *state) /* "granted", "denied", or NULL = ask */
+{
+    if (!origin || !*origin || !name || !*name)
+        return;
+    char *key = g_strdup_printf("%s|%s", origin, name);
+    if (state)
+        g_hash_table_replace(b->permissions, key, g_strdup(state));
+    else
+        g_hash_table_remove(b->permissions, key);
+    g_free(key);
+    perm_save(b);
+}
+
+/* Human-readable label for a permission name (raw WebKit name unknown
+ * names are shown as-is, first letter uppercased). */
+static char *perm_display_name(const char *name)
+{
+    static const struct { const char *raw; const char *label; } known[] = {
+        { "geolocation", "Location" },
+        { "notifications", "Notifications" },
+        { "notification", "Notifications" },
+        { "audio-capture", "Microphone" },
+        { "video-capture", "Camera" },
+        { "display-capture", "Screen recording" },
+        { "media", "Camera / microphone" },
+        { "device-info", "Device information" },
+        { "pointer-lock", "Pointer lock" },
+        { "clipboard", "Clipboard" },
+        { "clipboard-read", "Clipboard (read)" },
+        { "clipboard-write", "Clipboard (write)" },
+        { "media-key-system", "Protected content (DRM)" },
+        { "storage-access", "Cross-site data access" },
+        { "website-data-access", "Cross-site data access" },
+        { "xr", "VR / AR (WebXR)" },
+        { "webxr", "VR / AR (WebXR)" },
+        { "install-missing-media-plugins", "Media plugins" },
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(known); i++)
+        if (g_strcmp0(known[i].raw, name) == 0)
+            return g_strdup(known[i].label);
+    char *out = g_strdup(name);
+    if (out[0])
+        out[0] = g_ascii_toupper(out[0]);
+    return out;
+}
+
+/* The origin of the page currently shown in the view (scheme://host[:port]),
+ * or NULL for non-web pages. */
+static char *view_origin_string(WebKitWebView *view)
+{
+    const char *uri = webkit_web_view_get_uri(view);
+    if (!uri || !(g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://")))
+        return NULL;
+    GUri *u = g_uri_parse(uri, 0, NULL);
+    if (!u)
+        return NULL;
+    const char *scheme = g_uri_get_scheme(u);
+    const char *host = g_uri_get_host(u);
+    gint port = g_uri_get_port(u);
+    char *out;
+    if (port > 0 &&
+        !(g_ascii_strcasecmp(scheme, "http") == 0 && port == 80) &&
+        !(g_ascii_strcasecmp(scheme, "https") == 0 && port == 443))
+        out = g_strdup_printf("%s://%s:%d", scheme, host, port);
+    else
+        out = g_strdup_printf("%s://%s", scheme, host);
+    g_uri_unref(u);
+    return out;
+}
+
+/* Ask the user. Returns TRUE to allow the request, FALSE to deny it, and
+ * sets *mode_out to 0 ("ask every time"), 1 ("always allow") or 2
+ * ("always deny") so the caller persists a decision only when the user
+ * picked an "always" radio. */
+static gboolean perm_prompt(Browser *b, const char *origin, const char *desc,
+                            int *mode_out)
+{
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Permission request", GTK_WINDOW(win_toplevel(b)), GTK_DIALOG_MODAL,
+        "_Deny", GTK_RESPONSE_REJECT, "_Allow", GTK_RESPONSE_ACCEPT, NULL);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 12);
+    gtk_box_set_spacing(GTK_BOX(box), 8);
+
+    GtkWidget *org = gtk_label_new(origin);
+    gtk_widget_set_halign(org, GTK_ALIGN_START);
+    GtkWidget *dsc = gtk_label_new(desc);
+    gtk_label_set_line_wrap(GTK_LABEL(dsc), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(dsc), 0.0);
+    GtkWidget *r_ask = gtk_radio_button_new_with_label(NULL, "Ask every time");
+    GtkWidget *r_allow = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(r_ask), "Always allow for this site");
+    GtkWidget *r_deny = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(r_ask), "Always deny for this site");
+    gtk_box_pack_start(GTK_BOX(box), org, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), dsc, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), r_ask, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), r_allow, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), r_deny, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gboolean mode_allow = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(r_allow));
+    gboolean mode_deny = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(r_deny));
+    gtk_widget_destroy(dialog);
+
+    *mode_out = mode_allow ? 1 : (mode_deny ? 2 : 0);
+    gboolean allow = (response == GTK_RESPONSE_ACCEPT);
+    if (mode_allow)
+        allow = TRUE;
+    if (mode_deny)
+        allow = FALSE;
+    return allow;
+}
+
+/* What a permission request is about: its canonical name and a one-line
+ * description for the prompt. *name_out borrows a static string except in
+ * the unknown-type branch, which allocates (flagged via *name_owned). */
+static void perm_request_info(WebKitPermissionRequest *req,
+                              const char **name_out, char **desc_out,
+                              gboolean *name_owned)
+{
+    const char *name = NULL;
+    char *desc = NULL;
+    *name_owned = FALSE;
+    if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST(req)) {
+        name = "geolocation";
+        desc = g_strdup("access your location");
+    } else if (WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST(req)) {
+        name = "notifications";
+        desc = g_strdup("send you notifications");
+    } else if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(req)) {
+        WebKitUserMediaPermissionRequest *um = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(req);
+        if (webkit_user_media_permission_is_for_video_device(um)) {
+            name = "video-capture";
+            desc = g_strdup("use your camera");
+        } else if (webkit_user_media_permission_is_for_audio_device(um)) {
+            name = "audio-capture";
+            desc = g_strdup("use your microphone");
+        } else if (webkit_user_media_permission_is_for_display_device(um)) {
+            name = "display-capture";
+            desc = g_strdup("record or share your screen");
+        } else {
+            name = "media";
+            desc = g_strdup("use your camera and microphone");
+        }
+    } else if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST(req)) {
+        name = "device-info";
+        desc = g_strdup("read information about your devices");
+    } else if (strstr(g_type_name(G_OBJECT_TYPE(req)),
+                  "PointerLockPermissionRequest") != NULL) {
+        /* the public headers only expose this type behind a build flag,
+         * so match it by GType name */
+        name = "pointer-lock";
+        desc = g_strdup("capture your mouse pointer");
+    } else if (WEBKIT_IS_CLIPBOARD_PERMISSION_REQUEST(req)) {
+        name = "clipboard";
+        desc = g_strdup("read and write your clipboard");
+    } else if (WEBKIT_IS_MEDIA_KEY_SYSTEM_PERMISSION_REQUEST(req)) {
+        name = "media-key-system";
+        desc = g_strdup("play protected content (DRM)");
+    } else if (WEBKIT_IS_WEBSITE_DATA_ACCESS_PERMISSION_REQUEST(req)) {
+        WebKitWebsiteDataAccessPermissionRequest *wd =
+            WEBKIT_WEBSITE_DATA_ACCESS_PERMISSION_REQUEST(req);
+        name = "storage-access";
+        const char *rd = webkit_website_data_access_permission_request_get_requesting_domain(wd);
+        const char *cd = webkit_website_data_access_permission_request_get_current_domain(wd);
+        desc = g_strdup_printf("access %s data from %s",
+                               rd ? rd : "the requesting site",
+                               cd ? cd : "this site");
+    } else if (WEBKIT_IS_XR_PERMISSION_REQUEST(req)) {
+        name = "xr";
+        desc = g_strdup("use VR / AR (WebXR)");
+    } else if (WEBKIT_IS_INSTALL_MISSING_MEDIA_PLUGINS_PERMISSION_REQUEST(req)) {
+        WebKitInstallMissingMediaPluginsPermissionRequest *mm =
+            WEBKIT_INSTALL_MISSING_MEDIA_PLUGINS_PERMISSION_REQUEST(req);
+        name = "install-missing-media-plugins";
+        const char *d = webkit_install_missing_media_plugins_permission_request_get_description(mm);
+        desc = d && *d ? g_strdup_printf("install missing media plugins (%s)", d)
+                       : g_strdup("install missing media plugins");
+    } else {
+        char *t = g_strdup(g_type_name(G_OBJECT_TYPE(req)));
+        for (char *c = t; *c; c++)
+            *c = g_ascii_tolower(*c);
+        name = t;
+        *name_owned = TRUE; /* only this branch allocates *name_out */
+        desc = g_strdup("request a permission");
+    }
+    *name_out = name;
+    *desc_out = desc;
+}
+
+/* WebKit checks whether a (origin, name) decision was stored. We answer
+ * from our own store; PROMPT means "ask the user" (the request signal
+ * follows). */
+static gboolean on_query_permission_state(WebKitWebView *view,
+                                          WebKitPermissionStateQuery *query,
+                                          Tab *tab)
+{
+    (void)view;
+    Browser *b = tab->win->browser;
+    WebKitSecurityOrigin *so = webkit_permission_state_query_get_security_origin(query);
+    char *origin = so ? webkit_security_origin_to_string(so) : NULL;
+    const char *name = webkit_permission_state_query_get_name(query);
+
+    g_free(tab->perm_pending_name);
+    g_free(tab->perm_pending_origin);
+    tab->perm_pending_name = NULL;
+    tab->perm_pending_origin = NULL;
+
+    WebKitPermissionState state = WEBKIT_PERMISSION_STATE_PROMPT;
+    const char *v = perm_lookup(b, origin, name);
+    if (g_strcmp0(v, "granted") == 0)
+        state = WEBKIT_PERMISSION_STATE_GRANTED;
+    else if (g_strcmp0(v, "denied") == 0)
+        state = WEBKIT_PERMISSION_STATE_DENIED;
+    /* only a PROMPT answer is followed by a request, so only then is the
+     * (origin, name) pair the one a later decision will be stored under */
+    if (state == WEBKIT_PERMISSION_STATE_PROMPT &&
+        origin && *origin && name && *name) {
+        tab->perm_pending_name = g_strdup(name);
+        tab->perm_pending_origin = g_strdup(origin);
+    }
+    webkit_permission_state_query_finish(query, state);
+    g_free(origin);
+    return TRUE;
+}
+
+/* The user-facing prompt for a permission request. */
+static gboolean on_permission_request(WebKitWebView *view,
+                                      WebKitPermissionRequest *req,
+                                      Tab *tab)
+{
+    Browser *b = tab->win->browser;
+    char *vorigin = view_origin_string(view);
+    char *qname = tab->perm_pending_name;
+    char *qorigin = tab->perm_pending_origin;
+    tab->perm_pending_name = NULL;
+    tab->perm_pending_origin = NULL;
+
+    const char *type_name;
+    char *desc;
+    gboolean type_name_owned = FALSE;
+    perm_request_info(req, &type_name, &desc, &type_name_owned);
+
+    /* a stored decision skips the prompt entirely */
+    const char *saved = NULL;
+    if (qorigin && qname)
+        saved = perm_lookup(b, qorigin, qname);
+    if (!saved && vorigin)
+        saved = perm_lookup(b, vorigin, type_name);
+    if (saved) {
+        if (g_strcmp0(saved, "granted") == 0)
+            webkit_permission_request_allow(req);
+        else
+            webkit_permission_request_deny(req);
+        if (type_name_owned)
+            g_free((char *)type_name);
+        g_free(desc);
+        g_free(qname);
+        g_free(qorigin);
+        g_free(vorigin);
+        return TRUE;
+    }
+
+    /* show the prompt */
+    const char *disp = (qorigin && *qorigin) ? qorigin :
+                       (vorigin ? vorigin : "a local page");
+    int mode;
+    gboolean allow = perm_prompt(b, disp, desc, &mode);
+
+    /* record an "always" decision under the query's key when we know it
+     * (that is the key WebKit will query again); otherwise fall back to
+     * the view's origin plus the type name */
+    const char *key_origin = (qorigin && *qorigin) ? qorigin : vorigin;
+    const char *key_name = (qname && *qname) ? qname : type_name;
+    if (mode == 1 && key_origin && *key_origin && key_name)
+        perm_set(b, key_origin, key_name, "granted");
+    else if (mode == 2 && key_origin && *key_origin && key_name)
+        perm_set(b, key_origin, key_name, "denied");
+
+    if (allow)
+        webkit_permission_request_allow(req);
+    else
+        webkit_permission_request_deny(req);
+
+    if (type_name_owned)
+        g_free((char *)type_name);
+    g_free(desc);
+    g_free(qname);
+    g_free(qorigin);
+    g_free(vorigin);
+    return TRUE;
+}
+
+/* ---------- permission manager (Settings → Manage permissions) ---------- */
+
+typedef struct {
+    Browser *b;
+    GtkListStore *store;   /* origin, raw name, display name, state text */
+    GtkTreeView *tv;
+    GtkWidget *empty_lbl;
+} PermMgr;
+
+/* store columns */
+#define PM_ORIGIN 0
+#define PM_NAME   1
+#define PM_DISPLAY 2
+#define PM_STATE  3
+
+static void perm_mgr_reload(PermMgr *m);
+
+/* Apply the state attached to the clicked button ("granted" / "denied" /
+ * NULL = ask again) to the selected row. */
+static void on_perm_set_state_clicked(GtkButton *btn, gpointer d)
+{
+    PermMgr *m = d;
+    const char *state = g_object_get_data(G_OBJECT(btn), "perm-state");
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(m->tv);
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(sel, &model, &iter))
+        return;
+    char *origin, *name;
+    gtk_tree_model_get(model, &iter, PM_ORIGIN, &origin, PM_NAME, &name, -1);
+    perm_set(m->b, origin, name, state);
+    g_free(origin);
+    g_free(name);
+    perm_mgr_reload(m);
+}
+
+static void on_perm_clear_clicked(GtkButton *btn, gpointer d)
+{
+    (void)btn;
+    PermMgr *m = d;
+    g_hash_table_remove_all(m->b->permissions);
+    perm_save(m->b);
+    perm_mgr_reload(m);
+}
+
+static void perm_mgr_reload(PermMgr *m)
+{
+    gtk_list_store_clear(m->store);
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, m->b->permissions);
+    int n = 0;
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        char *p = g_strdup((const char *)k);
+        char *bar = strchr(p, '|');
+        if (!bar || !bar[1]) {
+            g_free(p);
+            continue;
+        }
+        *bar = '\0';
+        GtkTreeIter iter;
+        gtk_list_store_append(m->store, &iter);
+        gtk_list_store_set(m->store, &iter, PM_ORIGIN, p, PM_NAME, bar + 1,
+                           PM_DISPLAY, perm_display_name(bar + 1),
+                           PM_STATE,
+                           g_strcmp0(v, "granted") == 0 ? "Allow" : "Deny",
+                           -1);
+        g_free(p);
+        n++;
+    }
+    gtk_widget_set_visible(m->empty_lbl, n == 0);
+}
+
+static void on_manage_permissions_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Site permissions",
+                                                    GTK_WINDOW(win_toplevel(b)),
+                                                    GTK_DIALOG_MODAL,
+                                                    "_Close", GTK_RESPONSE_CLOSE,
+                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 640, 420);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+    gtk_box_set_spacing(GTK_BOX(box), 6);
+
+    GtkWidget *hint = gtk_label_new(
+        "Saved decisions from the permission prompts. Select a row and use "
+        "the buttons below; “Set to Ask” (or deleting a row) forgets the "
+        "decision so the site is asked again.");
+    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+
+    PermMgr *m = g_new0(PermMgr, 1);
+    m->b = b;
+    m->store = gtk_list_store_new(4, G_TYPE_STRING, G_TYPE_STRING,
+                                  G_TYPE_STRING, G_TYPE_STRING);
+    GtkWidget *tv = gtk_tree_view_new_with_model(GTK_TREE_MODEL(m->store));
+    m->tv = GTK_TREE_VIEW(tv);
+
+    GtkCellRenderer *ro = gtk_cell_renderer_text_new();
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tv),
+        gtk_tree_view_column_new_with_attributes("Origin", ro, "text",
+                                                 PM_ORIGIN, NULL));
+    GtkCellRenderer *rd = gtk_cell_renderer_text_new();
+    int perm_col = gtk_tree_view_append_column(GTK_TREE_VIEW(tv),
+        gtk_tree_view_column_new_with_attributes("Permission", rd,
+                                                 "text", PM_DISPLAY, NULL));
+    gtk_tree_view_column_set_expand(
+        /* append_column returns a 1-based position in this build */
+        gtk_tree_view_get_column(GTK_TREE_VIEW(tv), perm_col - 1), TRUE);
+    GtkCellRenderer *rs = gtk_cell_renderer_text_new();
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tv),
+        gtk_tree_view_column_new_with_attributes("Decision", rs, "text",
+                                                 PM_STATE, NULL));
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(m->tv),
+                                GTK_SELECTION_BROWSE);
+
+    m->empty_lbl = gtk_label_new("No saved decisions yet.");
+    gtk_box_pack_start(GTK_BOX(box), m->empty_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(sw), tv);
+    gtk_box_pack_start(GTK_BOX(box), sw, TRUE, TRUE, 0);
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *allow_btn = gtk_button_new_with_label("Set _Allow");
+    g_object_set_data(G_OBJECT(allow_btn), "perm-state", (gpointer)"granted");
+    gtk_widget_set_tooltip_text(allow_btn, "Always allow for the selected site");
+    g_signal_connect(allow_btn, "clicked", G_CALLBACK(on_perm_set_state_clicked), m);
+    GtkWidget *deny_btn = gtk_button_new_with_label("Set _Deny");
+    g_object_set_data(G_OBJECT(deny_btn), "perm-state", (gpointer)"denied");
+    gtk_widget_set_tooltip_text(deny_btn, "Always deny for the selected site");
+    g_signal_connect(deny_btn, "clicked", G_CALLBACK(on_perm_set_state_clicked), m);
+    GtkWidget *ask_btn = gtk_button_new_with_label("Set to _Ask");
+    g_object_set_data(G_OBJECT(ask_btn), "perm-state", NULL);
+    gtk_widget_set_tooltip_text(ask_btn, "Forget the decision; ask again next time");
+    g_signal_connect(ask_btn, "clicked", G_CALLBACK(on_perm_set_state_clicked), m);
+    GtkWidget *clear_btn = gtk_button_new_with_label("Clear _all");
+    gtk_widget_set_tooltip_text(clear_btn, "Forget every saved decision");
+    g_signal_connect(clear_btn, "clicked", G_CALLBACK(on_perm_clear_clicked), m);
+    gtk_box_pack_start(GTK_BOX(row), allow_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), deny_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), ask_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), clear_btn, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
+
+    perm_mgr_reload(m);
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    g_free(m);
     gtk_widget_destroy(dialog);
 }
 
@@ -1128,6 +2056,12 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(on_notify_progress), tab);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), tab);
     g_signal_connect(view, "context-menu", G_CALLBACK(on_view_context_menu), tab);
+    /* site permissions: WebKit asks for a stored state first
+     * (query-permission-state), then a request if we answer PROMPT */
+    g_signal_connect(view, "permission-request",
+                     G_CALLBACK(on_permission_request), tab);
+    g_signal_connect(view, "query-permission-state",
+                     G_CALLBACK(on_query_permission_state), tab);
     /* shell-level drop fallback; runs before WebKit's own handlers, so
      * a drop the web page refused can be opened here as new tabs */
     g_signal_connect(view, "drag-motion", G_CALLBACK(on_view_drag_motion), tab);
@@ -2883,6 +3817,48 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     g_signal_connect(manage_btn, "clicked", G_CALLBACK(on_manage_history_clicked), b);
     gtk_box_pack_start(GTK_BOX(content), manage_btn, FALSE, FALSE, 0);
 
+    GtkWidget *perm_btn = gtk_button_new_with_label("Manage permissions…");
+    gtk_widget_set_halign(perm_btn, GTK_ALIGN_START);
+    gtk_widget_set_tooltip_text(perm_btn,
+        "Site decisions from the permission prompts (allow / deny)");
+    g_signal_connect(perm_btn, "clicked", G_CALLBACK(on_manage_permissions_clicked), b);
+    gtk_box_pack_start(GTK_BOX(content), perm_btn, FALSE, FALSE, 0);
+
+    GtkWidget *sc_btn = gtk_button_new_with_label("Manage shortcuts…");
+    gtk_widget_set_halign(sc_btn, GTK_ALIGN_START);
+    gtk_widget_set_tooltip_text(sc_btn, "Rebind the keyboard shortcuts");
+    g_signal_connect(sc_btn, "clicked", G_CALLBACK(on_manage_shortcuts_clicked), b);
+    gtk_box_pack_start(GTK_BOX(content), sc_btn, FALSE, FALSE, 0);
+
+    GtkWidget *dl_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(content), dl_sep, FALSE, FALSE, 0);
+    GtkWidget *dl_hdr = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(dl_hdr), "<b>Downloads</b>");
+    gtk_widget_set_halign(dl_hdr, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), dl_hdr, FALSE, FALSE, 0);
+
+    GtkWidget *dl_ask_check = gtk_check_button_new_with_label(
+        "Ask where to save each download");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dl_ask_check), b->download_ask);
+    gtk_widget_set_halign(dl_ask_check, GTK_ALIGN_START);
+    gtk_widget_set_tooltip_text(dl_ask_check,
+        "Off: files are saved straight to the download folder below and "
+        "tracked in the downloads list (toolbar button).");
+    gtk_box_pack_start(GTK_BOX(content), dl_ask_check, FALSE, FALSE, 0);
+
+    GtkWidget *dl_dir_entry = setting_entry_row(content, "Download folder:",
+                                             b->download_dir,
+                                             "Default (~/Downloads)",
+                                             G_CALLBACK(on_download_dir_changed), b);
+    gtk_widget_set_name(dl_dir_entry, "download-dir-entry");
+    GtkWidget *dl_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *dl_btn = gtk_button_new_with_label("Choose…");
+    gtk_widget_set_tooltip_text(dl_btn,
+        "Pick the folder auto-downloads are saved to");
+    g_signal_connect(dl_btn, "clicked", G_CALLBACK(on_download_dir_browse), b);
+    gtk_box_pack_start(GTK_BOX(dl_row), dl_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), dl_row, FALSE, FALSE, 0);
+
     GtkWidget *tpc_check = gtk_check_button_new_with_label(
         "Block third-party (shared) cookies");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tpc_check), b->block_third_party);
@@ -2902,6 +3878,8 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     g_signal_connect(restore_check, "toggled", G_CALLBACK(on_restore_toggled), b);
     g_signal_connect(hide_tabbar_check, "toggled",
                      G_CALLBACK(on_hide_tabbar_toggled), b);
+    g_signal_connect(dl_ask_check, "toggled",
+                     G_CALLBACK(on_download_ask_toggled), b);
     g_signal_connect(tpc_check, "toggled",
                      G_CALLBACK(on_block_third_party_toggled), b);
     g_signal_connect(manage_cookies_btn, "clicked",
@@ -2911,6 +3889,49 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
         save_settings(b);
     gtk_widget_destroy(dialog);
+}
+
+/* Downloads settings handlers */
+static void on_download_ask_toggled(GtkToggleButton *btn, Browser *b)
+{
+    b->download_ask = gtk_toggle_button_get_active(btn);
+}
+
+static void on_download_dir_changed(GtkEntry *entry, Browser *b)
+{
+    const char *t = gtk_entry_get_text(entry);
+    g_free(b->download_dir);
+    b->download_dir = (*t ? g_strdup(t) : NULL);
+}
+
+static void on_download_dir_browse(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Choose download folder",
+                                                    GTK_WINDOW(win_toplevel(b)),
+                                                    GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Select", GTK_RESPONSE_ACCEPT,
+                                                    NULL);
+    if (b->download_dir && g_file_test(b->download_dir, G_FILE_TEST_IS_DIR))
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(chooser), b->download_dir);
+    else
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(chooser),
+                                            g_get_home_dir());
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        g_free(b->download_dir);
+        b->download_dir = fn;
+        save_settings(b);
+    }
+    gtk_widget_destroy(chooser);
+
+    /* refresh the settings entry, which also fires its "changed" handler */
+    GtkWidget *dlg = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_DIALOG);
+    GtkWidget *entry = dlg ? find_named(dlg, "download-dir-entry") : NULL;
+    if (entry)
+        gtk_entry_set_text(GTK_ENTRY(entry),
+                           b->download_dir ? b->download_dir : "");
 }
 
 /* ---------- KeePass integration ---------- */
@@ -2983,6 +4004,11 @@ static void load_settings(Browser *b)
         b->user_agent = g_key_file_get_string(kf, "general", "user_agent", NULL);
         if (!b->blocklist_file)
             b->blocklist_file = g_key_file_get_string(kf, "adblock", "blocklist", NULL);
+        if (g_key_file_has_key(kf, "downloads", "ask", NULL))
+            b->download_ask =
+                g_key_file_get_integer(kf, "downloads", "ask", NULL) != 0;
+        b->download_dir = g_key_file_get_string(kf, "downloads", "folder", NULL);
+        sc_load(b, kf); /* needs b->sc[] defaulted by sc_init() first */
     }
     g_key_file_unref(kf);
     g_free(path);
@@ -3014,6 +4040,11 @@ static void save_settings(Browser *b)
                            b->hide_tabbar ? 1 : 0);
     g_key_file_set_integer(kf, "cookies", "block_third_party",
                            b->block_third_party ? 1 : 0);
+    g_key_file_set_integer(kf, "downloads", "ask",
+                           b->download_ask ? 1 : 0);
+    if (b->download_dir)
+        g_key_file_set_string(kf, "downloads", "folder", b->download_dir);
+    sc_save(b, kf);
     char *path = settings_path();
     char *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
@@ -3972,6 +5003,17 @@ static void ctx_open_tab(GtkMenuItem *item, gpointer user_data)
         new_tab(tab->win, uri);
 }
 
+/* Start an explicit download of the right-clicked link. This WebKit build
+ * never turns a navigation into a download on its own, so this is the
+ * entry point to the downloads manager for files. */
+static void ctx_download(GtkMenuItem *item, gpointer user_data)
+{
+    (void)user_data;
+    const char *uri = g_object_get_data(G_OBJECT(item), "uri");
+    if (uri)
+        webkit_web_context_download_uri(webkit_web_context_get_default(), uri);
+}
+
 static void ctx_open_window(GtkMenuItem *item, gpointer user_data)
 {
     Tab *tab = user_data;
@@ -4053,6 +5095,7 @@ static gboolean on_view_context_menu(WebKitWebView *view, GtkWidget *menu,
     if (link) {
         ctx_uri(m, "Open in New Tab", link, tab, G_CALLBACK(ctx_open_tab));
         ctx_uri(m, "Open in New Window", link, tab, G_CALLBACK(ctx_open_window));
+        ctx_uri(m, "Download Link", link, tab, G_CALLBACK(ctx_download));
         ctx_uri(m, "Copy Link Address", link, tab, G_CALLBACK(ctx_copy_uri));
         ctx_sep(m);
     }
@@ -4087,7 +5130,248 @@ static gboolean on_view_context_menu(WebKitWebView *view, GtkWidget *menu,
     return TRUE; /* suppress WebKit's default menu */
 }
 
-/* ---------- keyboard shortcuts ---------- */
+/* ---------- keyboard shortcuts ----------
+ *
+ * Every action has a configurable accelerator (Settings → Manage
+ * shortcuts). on_key_press first handles the fixed tab jumps, then walks
+ * the SC_DEFS table below; on a conflicting binding the earlier action
+ * wins. Capture is done with plain GtkEntry fields: click one and press
+ * the combination. */
+
+static void sc_run_back(Win *win, Browser *b, Tab *tab)
+{
+    (void)b;
+    if (tab && webkit_web_view_can_go_back(tab->view))
+        webkit_web_view_go_back(tab->view);
+}
+
+static void sc_run_forward(Win *win, Browser *b, Tab *tab)
+{
+    (void)b;
+    if (tab && webkit_web_view_can_go_forward(tab->view))
+        webkit_web_view_go_forward(tab->view);
+}
+
+static void sc_run_reload(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        webkit_web_view_reload(tab->view);
+}
+
+static void sc_run_fullscreen(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    if (win->fullscreen)
+        gtk_window_unfullscreen(GTK_WINDOW(win->window));
+    else
+        gtk_window_fullscreen(GTK_WINDOW(win->window));
+    win->fullscreen = !win->fullscreen;
+}
+
+static void sc_run_new_tab(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    new_tab(win, NULL);
+}
+
+static void sc_run_close_tab(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+    GtkWidget *page = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
+    if (page)
+        close_tab(win, page);
+}
+
+static void sc_run_reopen_tab(Win *win, Browser *b, Tab *tab)
+{
+    (void)tab;
+    if (b->closed_tabs && b->closed_tabs->len) {
+        guint i = b->closed_tabs->len - 1;
+        ClosedTab *ct = g_ptr_array_index(b->closed_tabs, i);
+        GtkWidget *page = new_tab(win, ct->uri);
+        Tab *rtab = g_object_get_data(G_OBJECT(page), "tab");
+        if (rtab && ct->title)
+            gtk_label_set_text(GTK_LABEL(rtab->title_label), ct->title);
+        g_free(ct->uri);
+        g_free(ct->title);
+        g_free(ct);
+        g_ptr_array_remove_index(b->closed_tabs, i);
+    }
+}
+
+static void sc_run_focus_url(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    gtk_widget_grab_focus(win->url_entry);
+    gtk_editable_select_region(GTK_EDITABLE(win->url_entry), 0, -1);
+}
+
+static void sc_run_home(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    home_goto(win);
+}
+
+static void sc_run_find(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    find_open(win);
+}
+
+static void sc_run_bookmark(Win *win, Browser *b, Tab *tab)
+{
+    (void)win;
+    if (tab)
+        bookmark_toggle(b, webkit_web_view_get_uri(tab->view),
+                        webkit_web_view_get_title(tab->view));
+}
+
+static void sc_run_source(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        view_source_current(tab->view, tab);
+}
+
+static void sc_run_save_page(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        save_page_current(tab->view, tab);
+}
+
+static void sc_run_zoom_in(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        webkit_web_view_set_zoom_level(tab->view,
+                                       webkit_web_view_get_zoom_level(tab->view) + 0.1);
+}
+
+static void sc_run_zoom_out(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        webkit_web_view_set_zoom_level(tab->view,
+                                       webkit_web_view_get_zoom_level(tab->view) - 0.1);
+}
+
+static void sc_run_zoom_reset(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)b;
+    if (tab)
+        webkit_web_view_set_zoom_level(tab->view, 1.0);
+}
+
+static void sc_run_fill_login(Win *win, Browser *b, Tab *tab)
+{
+    (void)win; (void)tab;
+    fill_login(b);
+}
+
+static void sc_run_cycle_next(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    cycle_tab(win, 1);
+}
+
+static void sc_run_cycle_prev(Win *win, Browser *b, Tab *tab)
+{
+    (void)b; (void)tab;
+    cycle_tab(win, -1);
+}
+
+typedef struct {
+    const char *id;      /* settings key in the [shortcuts] group */
+    const char *label;   /* shown in the manager dialog */
+    const char *def;     /* default accelerator */
+    void (*run)(Win *win, Browser *b, Tab *tab);
+} ScDef;
+
+/* Indexed by ShortcutAction, in conflict-priority order. */
+static const ScDef SC_DEFS[SC_N_ACTIONS] = {
+    { "back",       "Back",               "Alt+Left",       sc_run_back },
+    { "forward",    "Forward",            "Alt+Right",      sc_run_forward },
+    { "reload",     "Reload / stop",      "F5",             sc_run_reload },
+    { "fullscreen", "Fullscreen",         "F11",            sc_run_fullscreen },
+    { "new_tab",    "New tab",            "Ctrl+T",         sc_run_new_tab },
+    { "close_tab",  "Close tab",          "Ctrl+W",         sc_run_close_tab },
+    { "reopen_tab", "Reopen closed tab",  "Ctrl+Shift+T",   sc_run_reopen_tab },
+    { "focus_url",  "Focus URL bar",      "Ctrl+L",         sc_run_focus_url },
+    { "home",       "Home",               "Ctrl+H",         sc_run_home },
+    { "find",       "Find in page",       "Ctrl+F",         sc_run_find },
+    { "bookmark",   "Bookmark page",      "Ctrl+D",         sc_run_bookmark },
+    { "source",     "View page source",   "Ctrl+U",         sc_run_source },
+    { "save_page",  "Save page as HTML",  "Ctrl+S",         sc_run_save_page },
+    { "zoom_in",    "Zoom in",            "Ctrl+Plus",      sc_run_zoom_in },
+    { "zoom_out",   "Zoom out",           "Ctrl+Minus",     sc_run_zoom_out },
+    { "zoom_reset", "Reset zoom",         "Ctrl+0",         sc_run_zoom_reset },
+    { "fill_login", "Fill login",         "Ctrl+Shift+L",   sc_run_fill_login },
+    { "cycle_next", "Next tab",           "Ctrl+Tab",       sc_run_cycle_next },
+    { "cycle_prev", "Previous tab",       "Ctrl+Shift+Tab", sc_run_cycle_prev },
+};
+
+/* Parse a shortcut's default into a ScKey (keyval 0 = disabled; this
+ * build's gtk_accelerator_parse returns void, so a failed parse is a
+ * zero keyval). */
+static ScKey sc_default(int i)
+{
+    guint keyval = 0;
+    GdkModifierType mods = 0;
+    gtk_accelerator_parse(SC_DEFS[i].def, &keyval, &mods);
+    return (ScKey){ keyval, mods };
+}
+
+static void sc_init(Browser *b)
+{
+    for (int i = 0; i < SC_N_ACTIONS; i++)
+        b->sc[i] = sc_default(i);
+}
+
+static void sc_load(Browser *b, GKeyFile *kf)
+{
+    for (int i = 0; i < SC_N_ACTIONS; i++) {
+        char *s = g_key_file_get_string(kf, "shortcuts", SC_DEFS[i].id, NULL);
+        if (!s)
+            continue;
+        guint keyval = 0;
+        GdkModifierType mods = 0;
+        gtk_accelerator_parse(s, &keyval, &mods);
+        if (keyval)
+            b->sc[i] = (ScKey){ keyval, mods };
+        g_free(s);
+    }
+}
+
+static void sc_save(Browser *b, GKeyFile *kf)
+{
+    for (int i = 0; i < SC_N_ACTIONS; i++) {
+        if (b->sc[i].keyval == 0)
+            continue;
+        /* get_label doubles as the persistable string ("Ctrl+T");
+         * gtk_accelerator_parse reads it back */
+        char *s = gtk_accelerator_get_label(b->sc[i].keyval, b->sc[i].mods);
+        g_key_file_set_string(kf, "shortcuts", SC_DEFS[i].id, s);
+        g_free(s);
+    }
+}
+
+/* Whether a (keyval, mods) event matches a configured shortcut. Shift+Tab
+ * arrives as ISO_Left_Tab on some keymaps and plus/equal are interchangeable
+ * (zoom in), so both are normalized. */
+static gboolean sc_match(const ScKey *sc, guint keyval, GdkModifierType mods)
+{
+    if (sc->keyval == 0)
+        return FALSE;
+    if (sc->keyval == GDK_KEY_Tab && keyval == GDK_KEY_ISO_Left_Tab)
+        keyval = GDK_KEY_Tab;
+    if ((sc->keyval == GDK_KEY_plus && keyval == GDK_KEY_equal) ||
+        (sc->keyval == GDK_KEY_equal && keyval == GDK_KEY_plus))
+        keyval = sc->keyval;
+    return keyval == sc->keyval && mods == sc->mods;
+}
 
 static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
 {
@@ -4097,135 +5381,10 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
     guint keyval = event->keyval;
     GdkModifierType mods = event->state & gtk_accelerator_get_default_mod_mask();
 
-    if (keyval == GDK_KEY_F5) {
-        if (tab)
-            webkit_web_view_reload(tab->view);
-        return TRUE;
-    }
-    if (keyval == GDK_KEY_F11) {
-        if (win->fullscreen)
-            gtk_window_unfullscreen(GTK_WINDOW(win->window));
-        else
-            gtk_window_fullscreen(GTK_WINDOW(win->window));
-        win->fullscreen = !win->fullscreen;
-        return TRUE;
-    }
-    if ((mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) &&
-        (keyval == GDK_KEY_l || keyval == GDK_KEY_L)) {
-        fill_login(b);
-        return TRUE;
-    }
-
-    /* Ctrl+Shift+T reopens the most recently closed tab. */
-    if (mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK) && keyval == GDK_KEY_t) {
-        if (b->closed_tabs && b->closed_tabs->len) {
-            guint i = b->closed_tabs->len - 1;
-            ClosedTab *ct = g_ptr_array_index(b->closed_tabs, i);
-            GtkWidget *page = new_tab(win, ct->uri);
-            Tab *rtab = g_object_get_data(G_OBJECT(page), "tab");
-            if (rtab && ct->title)
-                gtk_label_set_text(GTK_LABEL(rtab->title_label), ct->title);
-            g_free(ct->uri);
-            g_free(ct->title);
-            g_free(ct);
-            g_ptr_array_remove_index(b->closed_tabs, i);
-        }
-        return TRUE;
-    }
-    /* Alt+Left / Alt+Right navigate back / forward. */
-    if (mods == GDK_MOD1_MASK && tab) {
-        if (keyval == GDK_KEY_Left && webkit_web_view_can_go_back(tab->view)) {
-            webkit_web_view_go_back(tab->view);
-            return TRUE;
-        }
-        if (keyval == GDK_KEY_Right && webkit_web_view_can_go_forward(tab->view)) {
-            webkit_web_view_go_forward(tab->view);
-            return TRUE;
-        }
-        /* Alt+1..0 jump to a tab (Alt+0 -> first). */
-        if (keyval == GDK_KEY_0 ||
-            (keyval >= GDK_KEY_1 && keyval <= GDK_KEY_9)) {
-            GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
-            int n = gtk_notebook_get_n_pages(nb);
-            int idx = (keyval == GDK_KEY_0) ? 0 : (keyval - GDK_KEY_1);
-            if (n > 0)
-                gtk_notebook_set_current_page(nb, MIN(idx, n - 1));
-            return TRUE;
-        }
-        return FALSE;
-    }
-    /* Ctrl+Tab / Ctrl+Shift+Tab cycle tabs; Shift+Tab arrives as
-     * ISO_Left_Tab on some keymaps. */
-    if ((keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) &&
-        (mods & GDK_CONTROL_MASK)) {
-        cycle_tab(win, (mods & GDK_SHIFT_MASK) ? -1 : 1);
-        return TRUE;
-    }
-    if (mods != GDK_CONTROL_MASK)
-        return FALSE;
-
-    switch (keyval) {
-    case GDK_KEY_l:
-        gtk_widget_grab_focus(win->url_entry);
-        gtk_editable_select_region(GTK_EDITABLE(win->url_entry), 0, -1);
-        return TRUE;
-    case GDK_KEY_t:
-        new_tab(win, NULL);
-        return TRUE;
-    case GDK_KEY_w: {
-        GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
-        GtkWidget *page = gtk_notebook_get_nth_page(nb, gtk_notebook_get_current_page(nb));
-        if (page)
-            close_tab(win, page);
-        return TRUE;
-    }
-    case GDK_KEY_f:
-        find_open(win);
-        return TRUE;
-    case GDK_KEY_r:
-        if (tab)
-            webkit_web_view_reload(tab->view);
-        return TRUE;
-    case GDK_KEY_h:
-        home_goto(win);
-        return TRUE;
-    case GDK_KEY_plus:
-    case GDK_KEY_equal:
-        if (tab)
-            webkit_web_view_set_zoom_level(tab->view,
-                                           webkit_web_view_get_zoom_level(tab->view) + 0.1);
-        return TRUE;
-    case GDK_KEY_minus:
-        if (tab)
-            webkit_web_view_set_zoom_level(tab->view,
-                                           webkit_web_view_get_zoom_level(tab->view) - 0.1);
-        return TRUE;
-    case GDK_KEY_0:
-        if (tab)
-            webkit_web_view_set_zoom_level(tab->view, 1.0);
-        return TRUE;
-    case GDK_KEY_d:
-        if (tab)
-            bookmark_toggle(b, webkit_web_view_get_uri(tab->view),
-                            webkit_web_view_get_title(tab->view));
-        return TRUE;
-    case GDK_KEY_u:
-        if (tab)
-            view_source_current(tab->view, tab);
-        return TRUE;
-    case GDK_KEY_s:
-        if (tab)
-            save_page_current(tab->view, tab);
-        return TRUE;
-    case GDK_KEY_1:
-    case GDK_KEY_2:
-    case GDK_KEY_3:
-    case GDK_KEY_4:
-    case GDK_KEY_5:
-    case GDK_KEY_6:
-    case GDK_KEY_7:
-    case GDK_KEY_8:
-    case GDK_KEY_9: {
+    /* Tab jumps are fixed (not configurable): Ctrl+1..9 and Alt+1..0
+     * (Alt+0 -> first tab). */
+    if ((keyval >= GDK_KEY_1 && keyval <= GDK_KEY_9) &&
+        (mods == GDK_MOD1_MASK || mods == GDK_CONTROL_MASK)) {
         GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
         int n = gtk_notebook_get_n_pages(nb);
         int idx = keyval - GDK_KEY_1;
@@ -4233,8 +5392,250 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
             gtk_notebook_set_current_page(nb, MIN(idx, n - 1));
         return TRUE;
     }
+    if (mods == GDK_MOD1_MASK && keyval == GDK_KEY_0) {
+        GtkNotebook *nb = GTK_NOTEBOOK(win->notebook);
+        if (gtk_notebook_get_n_pages(nb) > 0)
+            gtk_notebook_set_current_page(nb, 0);
+        return TRUE;
+    }
+
+    /* Everything else is configurable (Settings → Manage shortcuts);
+     * earlier table entries win on a conflict. */
+    for (int i = 0; i < SC_N_ACTIONS; i++) {
+        if (sc_match(&b->sc[i], keyval, mods)) {
+            SC_DEFS[i].run(win, b, tab);
+            return TRUE;
+        }
     }
     return FALSE;
+}
+
+/* ---------- shortcut manager (Settings → Manage shortcuts) ---------- */
+
+/* One capture row: an entry that records the pressed key combination. */
+typedef struct {
+    GtkWidget *entry;
+    int action;      /* ShortcutAction index */
+    Browser *b;
+    GtkWidget *status; /* shared status/warning label */
+} ScRow;
+
+static char *sc_text(const ScKey *sc)
+{
+    if (sc->keyval == 0)
+        return g_strdup("(disabled)");
+    return gtk_accelerator_get_label(sc->keyval, sc->mods);
+}
+
+/* End the capture: drop focus from the entry so key presses reach the
+ * browser shortcuts again. (While the entry is focused, its key handler
+ * consumes everything, so no keyboard grab is needed.) */
+static void sc_capture_stop(GtkWidget *entry)
+{
+    gtk_window_set_focus(GTK_WINDOW(gtk_widget_get_toplevel(entry)), NULL);
+}
+
+/* The keyval of a bare modifier key (no gdk_keyval_type in this build). */
+static gboolean sc_is_mod_key(guint keyval)
+{
+    static const guint mods[] = {
+        GDK_KEY_Control_L, GDK_KEY_Control_R,
+        GDK_KEY_Shift_L, GDK_KEY_Shift_R,
+        GDK_KEY_Alt_L, GDK_KEY_Alt_R,
+        GDK_KEY_Meta_L, GDK_KEY_Meta_R,
+        GDK_KEY_Super_L, GDK_KEY_Super_R,
+        GDK_KEY_Hyper_L, GDK_KEY_Hyper_R,
+        GDK_KEY_Mode_switch, GDK_KEY_ISO_Level3_Shift,
+        GDK_KEY_ISO_Level5_Shift,
+    };
+    for (unsigned i = 0; i < G_N_ELEMENTS(mods); i++)
+        if (keyval == mods[i])
+            return TRUE;
+    return FALSE;
+}
+
+/* Applying a new binding: update the browser, the row's entry text, and
+ * the settings file. */
+static void sc_set_key(ScRow *r, guint keyval, GdkModifierType mods,
+                       const char *status)
+{
+    r->b->sc[r->action] = (ScKey){ keyval, mods };
+    char *t = sc_text(&r->b->sc[r->action]);
+    gtk_entry_set_text(GTK_ENTRY(r->entry), t);
+    g_free(t);
+    save_settings(r->b);
+    if (r->status)
+        gtk_label_set_text(GTK_LABEL(r->status), status ? status : "");
+}
+
+static void on_sc_reset_clicked(GtkButton *btn, gpointer d)
+{
+    (void)btn;
+    ScRow *r = d;
+    ScKey def = sc_default(r->action);
+    sc_set_key(r, def.keyval, def.mods, "Reset to default");
+}
+
+static void on_sc_reset_all_clicked(GtkButton *btn, gpointer d)
+{
+    (void)btn;
+    GPtrArray *rows = d;
+    if (!rows->len)
+        return;
+    Browser *b = ((ScRow *)g_ptr_array_index(rows, 0))->b;
+    for (guint i = 0; i < rows->len; i++) {
+        ScRow *r = g_ptr_array_index(rows, i);
+        ScKey def = sc_default(r->action);
+        r->b->sc[r->action] = def;
+        char *t = sc_text(&def);
+        gtk_entry_set_text(GTK_ENTRY(r->entry), t);
+        g_free(t);
+    }
+    save_settings(b);
+    ScRow *r0 = g_ptr_array_index(rows, 0);
+    if (r0->status)
+        gtk_label_set_text(GTK_LABEL(r0->status), "All shortcuts reset to defaults");
+}
+
+static gboolean sc_capture_key_press(GtkWidget *entry, GdkEventKey *event,
+                                     gpointer d)
+{
+    ScRow *r = d;
+    guint keyval = event->keyval;
+    GdkModifierType mods = event->state & gtk_accelerator_get_default_mod_mask();
+
+    if (keyval == GDK_KEY_Escape) { /* cancel */
+        if (r->status)
+            gtk_label_set_text(GTK_LABEL(r->status), "");
+        sc_capture_stop(entry);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Delete) { /* restore the default binding */
+        ScKey def = sc_default(r->action);
+        sc_set_key(r, def.keyval, def.mods, "Reset to default");
+        sc_capture_stop(entry);
+        return TRUE;
+    }
+    if (keyval == 0)
+        return TRUE;
+    if (sc_is_mod_key(keyval))
+        return TRUE; /* lone modifier presses are ignored */
+    /* bare Enter/Backspace just end the capture */
+    if ((keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter ||
+         keyval == GDK_KEY_BackSpace) &&
+        (mods & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SHIFT_MASK)) == 0) {
+        if (r->status)
+            gtk_label_set_text(GTK_LABEL(r->status), "");
+        sc_capture_stop(entry);
+        return TRUE;
+    }
+
+    /* normalize Shift+Tab so Ctrl+Shift+Tab can be captured as Tab */
+    guint k = (keyval == GDK_KEY_ISO_Left_Tab) ? GDK_KEY_Tab : keyval;
+
+    /* letters, Tab and other printable keys need a modifier, else they
+     * would swallow ordinary typing and focus traversal */
+    gboolean needs_mod = k == GDK_KEY_Tab ||
+                         g_unichar_isprint(gdk_keyval_to_unicode(k));
+    if (needs_mod &&
+        (mods & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SHIFT_MASK)) == 0) {
+        if (r->status)
+            gtk_label_set_text(GTK_LABEL(r->status),
+                               "Use a modifier key (Ctrl, Alt or Shift) too");
+        return TRUE;
+    }
+    /* digits with plain Ctrl/Alt are reserved for the fixed tab jumps */
+    if (k >= GDK_KEY_0 && k <= GDK_KEY_9 &&
+        (mods == GDK_CONTROL_MASK || mods == GDK_MOD1_MASK)) {
+        if (r->status)
+            gtk_label_set_text(GTK_LABEL(r->status),
+                               "Ctrl/Alt + a digit is reserved for tab jumps");
+        return TRUE;
+    }
+
+    /* warn about a conflict (the earlier action wins) but accept anyway */
+    for (int i = 0; i < SC_N_ACTIONS; i++) {
+        if (i != r->action &&
+            r->b->sc[i].keyval == k && r->b->sc[i].mods == mods) {
+            char *warn = g_strdup_printf("Conflicts with “%s” — the earlier "
+                                         "action wins", SC_DEFS[i].label);
+            if (r->status)
+                gtk_label_set_text(GTK_LABEL(r->status), warn);
+            g_free(warn);
+            break;
+        }
+    }
+    sc_set_key(r, k, mods, NULL);
+    sc_capture_stop(entry);
+    return TRUE;
+}
+
+static void on_manage_shortcuts_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Keyboard shortcuts",
+                                                    GTK_WINDOW(win_toplevel(b)),
+                                                    GTK_DIALOG_MODAL,
+                                                    "_Close", GTK_RESPONSE_CLOSE,
+                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 560, 560);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+    gtk_box_set_spacing(GTK_BOX(box), 6);
+
+    GtkWidget *hint = gtk_label_new(
+        "Click a shortcut field and press a key combination. Escape cancels, "
+        "Delete restores the default. Tab jumps (Ctrl+1–9, Alt+1–0) are fixed "
+        "and cannot be remapped.");
+    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+    gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+
+    GPtrArray *rows = g_ptr_array_new();
+    GtkWidget *status = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(status), 0.0);
+    gtk_widget_set_halign(status, GTK_ALIGN_START);
+
+    for (int i = 0; i < SC_N_ACTIONS; i++) {
+        GtkWidget *lbl = gtk_label_new(SC_DEFS[i].label);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        GtkWidget *entry = gtk_entry_new();
+        gtk_entry_set_text(GTK_ENTRY(entry), sc_text(&b->sc[i]));
+        gtk_widget_set_size_request(entry, 150, -1);
+        ScRow *r = g_new0(ScRow, 1);
+        r->entry = entry;
+        r->action = i;
+        r->b = b;
+        r->status = status;
+        g_ptr_array_add(rows, r);
+        g_signal_connect(entry, "key-press-event",
+                         G_CALLBACK(sc_capture_key_press), r);
+        GtkWidget *reset = gtk_button_new_with_label("Reset");
+        gtk_widget_set_tooltip_text(reset, "Restore the default shortcut");
+        g_signal_connect(reset, "clicked", G_CALLBACK(on_sc_reset_clicked), r);
+        gtk_grid_attach(GTK_GRID(grid), lbl, 0, i, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), entry, 1, i, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), reset, 2, i, 1, 1);
+    }
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(sw), grid);
+    gtk_box_pack_start(GTK_BOX(box), sw, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), status, FALSE, FALSE, 0);
+
+    GtkWidget *reset_all = gtk_button_new_with_label("Reset all to defaults");
+    gtk_widget_set_halign(reset_all, GTK_ALIGN_START);
+    g_signal_connect(reset_all, "clicked", G_CALLBACK(on_sc_reset_all_clicked), rows);
+    gtk_box_pack_start(GTK_BOX(box), reset_all, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    g_ptr_array_free(rows, TRUE);
+    gtk_widget_destroy(dialog);
 }
 
 /* ---------- control socket (single-instance + agent CLI) ---------- */
@@ -4508,6 +5909,31 @@ static void on_window_destroy(GtkWidget *w, Win *win)
         g_ptr_array_unref(b->closed_tabs);
         b->closed_tabs = NULL;
     }
+    if (b->downloads_window) {
+        gtk_widget_destroy(b->downloads_window); /* handler clears the field */
+        b->downloads_window = NULL;
+    }
+    if (b->downloads_model) {
+        g_object_unref(b->downloads_model);
+        b->downloads_model = NULL;
+    }
+    if (b->downloads) {
+        for (guint i = 0; i < b->downloads->len; i++) {
+            DlItem *it = g_ptr_array_index(b->downloads, i);
+            g_clear_object(&it->dl);
+            g_free(it->name);
+            g_free(it->dest_path);
+            g_free(it->dest_uri);
+            g_free(it);
+        }
+        g_ptr_array_unref(b->downloads);
+        b->downloads = NULL;
+    }
+    g_free(b->download_dir);
+    if (b->permissions) {
+        g_hash_table_unref(b->permissions);
+        b->permissions = NULL;
+    }
     g_free(b);
     gtk_main_quit();
 }
@@ -4607,6 +6033,14 @@ static Win *new_window(Browser *b)
     g_signal_connect(win->bookmarks_button, "clicked",
                      G_CALLBACK(on_bookmarks_clicked), b);
     gtk_box_pack_start(GTK_BOX(toolbar), win->bookmarks_button, FALSE, FALSE, 0);
+
+    win->downloads_button = gtk_button_new_from_icon_name("folder-download",
+                                                          GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_widget_set_tooltip_text(win->downloads_button,
+                                "Downloads — recent files and their progress");
+    g_signal_connect(win->downloads_button, "clicked",
+                     G_CALLBACK(on_downloads_clicked), b);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->downloads_button, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(toolbar), settings_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), new_tab_button, FALSE, FALSE, 0);
@@ -4822,6 +6256,8 @@ int main(int argc, char *argv[])
     b->default_zoom = 100;
     b->restore_session = TRUE;
     b->hide_tabbar = TRUE;
+    sc_init(b); /* before load_settings: sc_load() only overrides saved keys */
+    perm_load(b);
     load_settings(b);
     apply_cookie_policy(b);
     load_history(b);
@@ -4830,6 +6266,11 @@ int main(int argc, char *argv[])
     b->windows = g_ptr_array_new();
     b->url_model = gtk_list_store_new(1, G_TYPE_STRING);
     refresh_url_model(b);
+    b->downloads = g_ptr_array_new();
+    b->downloads_model = gtk_list_store_new(4, G_TYPE_POINTER,
+                                            G_TYPE_STRING, G_TYPE_STRING,
+                                            G_TYPE_STRING);
+    g_timeout_add_seconds(1, on_dl_stall_check, b);
 
     Win *w0 = new_window(b);
 

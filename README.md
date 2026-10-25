@@ -74,8 +74,30 @@ Installs:
   value, expiry, flags), marks shared/third-party cookies, and can delete,
   clear, export to, or import from the standard `cookies.txt` format;
   "Block third-party (shared) cookies" in Settings stops them at the source
+- Permission prompts: when a site asks for location, camera / microphone,
+  screen recording, notifications, clipboard, protected content (DRM), or
+  another permission, a prompt offers "Ask every time", "Always allow", or
+  "Always deny"; stored decisions skip the prompt. Settings →
+  "Manage permissions…" lists the saved decisions (site, permission,
+  Allow/Deny) and lets you change any of them or clear all of them
+- Downloads manager: files are saved straight to the download folder
+  (Settings → "Download folder:", default: the XDG "Downloads" directory)
+  and tracked in a global list — the toolbar's downloads button opens the
+  window, which shows live progress and then Done / Failed / Canceled with
+  Open, Show in Folder, Cancel, Remove, and Clear-finished actions. This
+  WebKit build never turns a navigation into a download (file links render
+  as raw text instead), so downloads start from the context menu's
+  "Download Link" item (right-click a link). Enable "Ask where to save each
+  download" in Settings to get a save-file dialog for every download
+  instead
 - `window.open()` and `target="_blank"` links open in new tabs
-- Downloads prompt a save-file dialog
+- Keyboard shortcuts: Settings → "Manage shortcuts…" rebinds every
+  shortcut — click a field and press the combination (Escape cancels,
+  Delete restores the default, bare Enter/Backspace ends the capture).
+  Letters need a modifier, Ctrl/Alt + a digit is reserved for tab jumps,
+  and a conflicting binding warns you (the earlier action wins). Tab
+  jumps (`Ctrl+1`…`Ctrl+9`, `Alt+1`…`Alt+0`) are fixed and can't be
+  remapped
 - Drag & drop: drop a link or URL anywhere on the window (toolbar, tab
   strip, or page) and it opens — in a new tab, or the current tab if the
   page accepts the drop. A dropped file is handed to the page when the page
