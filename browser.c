@@ -1055,6 +1055,9 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     update_url_entry(win, tab);
     update_nav_buttons(win, tab);
     update_window_title(win, tab);
+    /* give the new tab's view the input focus so its text caret is drawn;
+     * a WebKit view that never receives a focus-in doesn't blink its caret */
+    gtk_widget_grab_focus(GTK_WIDGET(view));
     return page;
 }
 
@@ -1131,6 +1134,10 @@ static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, Win *win
     update_url_entry(win, tab);
     update_nav_buttons(win, tab);
     update_window_title(win, tab);
+    /* give the page the input focus so its text caret shows; keep the URL bar
+     * focused when it already is (e.g. cycling tabs while typing a URL) */
+    if (tab && !gtk_widget_has_focus(win->url_entry))
+        gtk_widget_grab_focus(GTK_WIDGET(tab->view));
 }
 
 /* ---------- find in page (Ctrl+F) ---------- */
@@ -3342,6 +3349,20 @@ static void on_window_focus_in(GtkWidget *w, GdkEvent *e, Win *win)
 {
     (void)w; (void)e;
     win->browser->active = win;
+    /* When the toplevel regains X focus, GTK re-focuses its focus widget,
+     * but for the NO_WINDOW WebKit view that re-focus doesn't always reach
+     * WebCore, so the text caret can stop blinking. If the window's focus is
+     * nominally on the view (or nowhere at all), force a focus round-trip so
+     * the view gets a fresh focus-in; leave it alone when another widget
+     * (e.g. the URL bar) holds the focus. */
+    Tab *tab = current_tab(win);
+    if (!tab)
+        return;
+    GtkWidget *fw = gtk_window_get_focus(GTK_WINDOW(win->window));
+    if (!fw || fw == GTK_WIDGET(tab->view)) {
+        gtk_window_set_focus(GTK_WINDOW(win->window), NULL);
+        gtk_window_set_focus(GTK_WINDOW(win->window), GTK_WIDGET(tab->view));
+    }
 }
 
 static void close_window(Win *win)
@@ -3688,6 +3709,13 @@ int main(int argc, char *argv[])
     g_free(cli_cmd);
 
     /* ---- no running instance: start the browser ---- */
+    /* Disable WebKit's DMABUF GPU renderer: on some systems (e.g. multi-GPU
+     * NVIDIA, VMs, containers) it picks a GPU it lacks DRM permission for and
+     * fails with "DRM_IOCTL_MODE_CREATE_DUMB: Permission denied", leaving the
+     * web view unrendered (blank/white page, no blinking text caret).
+     * Software rendering is the reliable fallback; remove this call and
+     * rebuild to try GPU rendering. See WebKit bug 259644/261874. */
+    g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     gtk_init(&argc, &argv);
 
     atom_text_uri_list  = gdk_atom_intern("text/uri-list", FALSE);
@@ -3697,10 +3725,6 @@ int main(int argc, char *argv[])
     atom_text_text      = gdk_atom_intern("TEXT", FALSE);
     atom_text_html      = gdk_atom_intern("text/html", FALSE);
     atom_netscape_url   = gdk_atom_intern("_NETSCAPE_URL", FALSE);
-    /* Force the software renderer. When the GPU/DMABUF renderer cannot get
-     * permission to create GPU buffers (VMs, containers, headless setups),
-     * WebKit leaves the page blank; software rendering always works. */
-    setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
 
     if (no_sandbox)
         webkit_web_context_set_sandbox_enabled(webkit_web_context_get_default(), FALSE);

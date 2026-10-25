@@ -73,6 +73,10 @@ Installs:
 
 - If pages fail to load with sandbox errors (e.g. missing bubblewrap), run with
   `./gtkbrowser --no-sandbox`.
+- If pages render blank/white (e.g. on multi-GPU NVIDIA systems, VMs, or
+  containers where WebKit's GPU/DMABUF renderer can't create DRM buffers),
+  software rendering is forced automatically via `WEBKIT_DISABLE_DMABUF_RENDERER`
+  in `main()`; remove that call and rebuild to try GPU rendering.
 - Developer tools are enabled: right-click → Inspect Element.
 - WebKitGTK does not expose dropped file contents to web pages (file access
   is disabled in the GTK port — https://webkit.org/b/271957), so sites such
