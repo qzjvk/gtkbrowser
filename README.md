@@ -61,6 +61,10 @@ Installs:
   counter in the toolbar; toggle and custom blocklist in Settings
 - KeePass autofill: `Ctrl+Shift+L` fills the current page's login via
   `keepassxc-cli`; database chosen in Settings
+- Cookie manager: Settings → "Manage cookies…" lists every cookie (site,
+  value, expiry, flags), marks shared/third-party cookies, and can delete,
+  clear, export to, or import from the standard `cookies.txt` format;
+  "Block third-party (shared) cookies" in Settings stops them at the source
 - `window.open()` and `target="_blank"` links open in new tabs
 - Downloads prompt a save-file dialog
 - Drag & drop: drop a link or URL anywhere on the window (toolbar, tab

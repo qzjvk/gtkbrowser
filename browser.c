@@ -19,6 +19,7 @@
  *   --no-sandbox            disable the WebKit sandbox
  *   --blocklist <file>      extra ad/tracker hosts to block (one per line)
  */
+#include <glib.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 #include <jsc/jsc.h>
@@ -26,6 +27,7 @@
 #include "keepass.h"
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -97,6 +99,8 @@ struct Browser {
     GPtrArray *closed_tabs;  /* most-recent-closed first (Ctrl+Shift+T) */
     gboolean restore_session; /* reopen last session's tabs at start */
     gboolean hide_tabbar;    /* hide the tab strip in single-tab windows */
+    gboolean block_third_party; /* reject cookies set by third-party sites */
+    GHashTable *visited_hosts;  /* top-level hosts visited; flags shared cookies */
 };
 
 /* Per-window state: the toplevel and everything that lives inside it. */
@@ -202,6 +206,9 @@ static gboolean on_find_key_press(GtkWidget *w, GdkEventKey *e, Win *win);
 static void on_restore_toggled(GtkToggleButton *btn, Browser *b);
 static void on_hide_tabbar_toggled(GtkToggleButton *btn, Browser *b);
 static void on_manage_history_clicked(GtkButton *btn, Browser *b);
+static void on_manage_cookies_clicked(GtkButton *btn, Browser *b);
+static void on_block_third_party_toggled(GtkToggleButton *btn, Browser *b);
+static void apply_cookie_policy(Browser *b);
 static void history_save(Browser *b);
 static void bookmarks_save(Browser *b);
 static void session_save(Browser *b);
@@ -879,6 +886,23 @@ static void on_notify_uri(WebKitWebView *view, GParamSpec *ps, Tab *tab)
 {
     if (current_tab(tab->win) == tab)
         update_url_entry(tab->win, tab);
+    /* record visited top-level hosts so the cookie manager can flag cookies
+     * from sites we haven't visited as "shared" */
+    const char *uri = webkit_web_view_get_uri(view);
+    if (uri && (g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://"))) {
+        GUri *u = g_uri_parse(uri, 0, NULL);
+        const char *host = u ? g_uri_get_host(u) : NULL;
+        if (host && *host) {
+            Browser *b = tab->win->browser;
+            if (!b->visited_hosts)
+                b->visited_hosts = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                         g_free, NULL);
+            g_hash_table_replace(b->visited_hosts, g_strdup(host), (gpointer)1);
+            if (g_hash_table_size(b->visited_hosts) > 2000)
+                g_hash_table_remove_all(b->visited_hosts);
+        }
+        g_uri_unref(u);
+    }
 }
 
 static void on_notify_loading(WebKitWebView *view, GParamSpec *ps, Tab *tab)
@@ -1388,6 +1412,17 @@ static void apply_proxy_settings(Browser *b)
     }
 }
 
+/* Apply the cookie acceptance policy from settings. When blocking is on,
+ * WebKit itself refuses cookies set by anything other than the main document. */
+static void apply_cookie_policy(Browser *b)
+{
+    WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(
+        webkit_web_context_get_default());
+    webkit_cookie_manager_set_accept_policy(
+        cm, b->block_third_party ? WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY
+                                 : WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+}
+
 static void set_adblock_enabled(Browser *b, gboolean enabled)
 {
     b->adblock_enabled = enabled;
@@ -1410,6 +1445,13 @@ static void on_adblock_toggled(GtkToggleButton *btn, Browser *b)
     set_adblock_enabled(b, gtk_toggle_button_get_active(btn));
     /* sync the toggle back if enabling failed (e.g. bind error) */
     gtk_toggle_button_set_active(btn, b->adblock_enabled);
+}
+
+static void on_block_third_party_toggled(GtkToggleButton *btn, Browser *b)
+{
+    b->block_third_party = gtk_toggle_button_get_active(btn);
+    apply_cookie_policy(b);
+    save_settings(b);
 }
 
 /* Call fn(tab, data) for every open tab in every window. */
@@ -1755,6 +1797,434 @@ static void on_manage_history_clicked(GtkButton *btn, Browser *b)
     gtk_widget_grab_focus(win_toplevel(b));
 }
 
+/* ---------- cookie manager ----------
+ *
+ * The whole cookie jar is fetched asynchronously from WebKit's cookie
+ * manager and shown in a list where entries can be inspected, deleted,
+ * cleared, or exported/imported in the standard Netscape/Mozilla
+ * "cookies.txt" format (the format curl and Firefox use). The "Shared"
+ * column flags cookies from sites this browser has not visited directly
+ * (third-party cookies); blocking them outright is a WebKit cookie-policy
+ * setting (see apply_cookie_policy()).
+ */
+
+typedef struct {
+    Browser *b;
+    GtkWidget *win;        /* NULL once the window is destroyed */
+    GtkTreeView *tv;
+    GtkListStore *store;
+    GtkWidget *shared_only;
+    GtkWidget *status;
+    GList *cookies;        /* SoupCookie* from WebKit (owned by this dialog) */
+    gboolean loading;      /* get_all_cookies in flight */
+    guint refresh_timer;   /* delayed refresh after delete/import (0 = none) */
+} CookieCtx;
+
+static WebKitCookieManager *cookie_manager_of(Browser *b)
+{
+    return webkit_web_context_get_cookie_manager(webkit_web_context_get_default());
+}
+
+static void cookie_free_list(GList *list)
+{
+    if (list)
+        g_list_free_full(list, (GDestroyNotify)soup_cookie_free);
+}
+
+static void cookie_set_status(CookieCtx *m, const char *text)
+{
+    gtk_label_set_text(GTK_LABEL(m->status), text);
+}
+
+/* A cookie is "shared" (third-party) when its site matches none of the
+ * top-level hosts this browser has visited. */
+static gboolean cookie_is_shared(SoupCookie *c, Browser *b)
+{
+    const char *domain = soup_cookie_get_domain(c);
+    if (!domain || !*domain || !b->visited_hosts || !g_hash_table_size(b->visited_hosts))
+        return FALSE;
+    char *d = g_strdup(domain);
+    if (d[0] == '.')
+        memmove(d, d + 1, strlen(d));
+    gboolean shared = TRUE;
+    GHashTableIter it;
+    gpointer v;
+    g_hash_table_iter_init(&it, b->visited_hosts);
+    while (shared && g_hash_table_iter_next(&it, &v, NULL)) {
+        const char *host = v;
+        size_t dl = strlen(d), vl = strlen(host);
+        if (dl == vl)
+            shared = (g_ascii_strcasecmp(d, host) != 0);
+        else if (vl > dl)
+            shared = !(host[vl - dl - 1] == '.' &&
+                       g_ascii_strncasecmp(host + (vl - dl), d, dl) == 0);
+        else
+            shared = !(d[dl - vl - 1] == '.' &&
+                       g_ascii_strncasecmp(d + (dl - vl), host, vl) == 0);
+    }
+    g_free(d);
+    return shared;
+}
+
+static void cookie_reload(CookieCtx *m)
+{
+    gtk_list_store_clear(m->store);
+    gboolean only_shared = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(m->shared_only));
+    guint n = 0;
+    GtkTreeIter iter;
+    for (GList *l = m->cookies; l; l = l->next) {
+        SoupCookie *c = l->data;
+        gboolean shared = cookie_is_shared(c, m->b);
+        if (only_shared && !shared)
+            continue;
+        const char *site = soup_cookie_get_domain(c);
+        GDateTime *exp = soup_cookie_get_expires(c);
+        char expbuf[40] = "session";
+        if (exp) {
+            char *s = g_date_time_format(exp, "%Y-%m-%d %H:%M");
+            g_snprintf(expbuf, sizeof(expbuf), "%s UTC", s);
+            g_free(s);
+        }
+        GString *flags = g_string_new(NULL);
+        if (soup_cookie_get_secure(c))
+            g_string_append(flags, "secure ");
+        if (soup_cookie_get_http_only(c))
+            g_string_append(flags, "http-only");
+        gtk_list_store_append(m->store, &iter);
+        gtk_list_store_set(m->store, &iter,
+                           0, site ? site : "",
+                           1, soup_cookie_get_name(c),
+                           2, soup_cookie_get_value(c),
+                           3, expbuf,
+                           4, flags->str,
+                           5, shared ? "yes" : "",
+                           6, c, -1);
+        g_string_free(flags, TRUE);
+        n++;
+    }
+    char msg[64];
+    g_snprintf(msg, sizeof(msg), "%u cookie%s", n, n == 1 ? "" : "s");
+    cookie_set_status(m, msg);
+}
+
+static void on_cookies_fetched(GObject *manager, GAsyncResult *res, gpointer data)
+{
+    CookieCtx *m = data;
+    g_assert(!m->loading);
+    GError *err = NULL;
+    GList *list = webkit_cookie_manager_get_all_cookies_finish(
+        WEBKIT_COOKIE_MANAGER(manager), res, &err);
+    g_clear_error(&err);
+    m->loading = FALSE;
+    if (!m->win) { /* the window was closed while the fetch was in flight */
+        cookie_free_list(list);
+        g_free(m);
+        return;
+    }
+    cookie_free_list(m->cookies);
+    m->cookies = list;
+    cookie_reload(m);
+}
+
+static void cookie_refresh(CookieCtx *m)
+{
+    if (m->loading || !m->win)
+        return;
+    m->loading = TRUE;
+    webkit_cookie_manager_get_all_cookies(cookie_manager_of(m->b), NULL,
+                                          on_cookies_fetched, m);
+}
+
+static void on_cookie_refresh_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    cookie_refresh(data);
+}
+
+static gboolean cookie_refresh_later(gpointer data)
+{
+    cookie_refresh(data);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_shared_only_toggled(GtkToggleButton *btn, gpointer data)
+{
+    (void)btn;
+    cookie_reload(data);
+}
+
+static void on_delete_cookie_done(GObject *manager, GAsyncResult *res, gpointer data)
+{
+    (void)manager; (void)res;
+    /* WebKit converts the cookie synchronously before dispatching, so it is
+     * safe to free it here */
+    soup_cookie_free(data);
+}
+
+static void cookie_delete_selected(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    CookieCtx *m = data;
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(m->tv));
+    GPtrArray *to_delete = g_ptr_array_new();
+    GtkTreeIter iter;
+    if (gtk_tree_model_iter_children(GTK_TREE_MODEL(m->store), &iter, NULL)) {
+        do {
+            if (gtk_tree_selection_path_is_selected(
+                    sel, gtk_tree_model_get_path(GTK_TREE_MODEL(m->store), &iter))) {
+                gpointer c;
+                gtk_tree_model_get(GTK_TREE_MODEL(m->store), &iter, 6, &c, -1);
+                g_ptr_array_add(to_delete, c);
+            }
+        } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(m->store), &iter));
+    }
+    if (!to_delete->len) {
+        g_ptr_array_free(to_delete, TRUE);
+        return;
+    }
+    guint n = to_delete->len;
+    /* The selected cookies are handed to WebKit and freed by
+     * on_delete_cookie_done(); free the rest of the jar now (the refresh
+     * below re-fetches everything from WebKit). */
+    for (GList *l = m->cookies; l; l = l->next)
+        if (g_ptr_array_find(to_delete, l->data, NULL) < 0)
+            soup_cookie_free(l->data);
+    g_list_free(m->cookies);
+    m->cookies = NULL;
+    /* drop the stale cookie pointers from column 6 until the refresh lands */
+    gtk_list_store_clear(m->store);
+    for (guint i = 0; i < to_delete->len; i++)
+        webkit_cookie_manager_delete_cookie(
+            cookie_manager_of(m->b),
+            (SoupCookie *)g_ptr_array_index(to_delete, i),
+            NULL, on_delete_cookie_done,
+            (gpointer)g_ptr_array_index(to_delete, i));
+    g_ptr_array_free(to_delete, TRUE);
+    char msg[32];
+    g_snprintf(msg, sizeof(msg), "Deleted %u cookie%s", (unsigned)n,
+               n == 1 ? "" : "s");
+    cookie_set_status(m, msg);
+    if (m->refresh_timer)
+        g_source_remove(m->refresh_timer);
+    /* the deletes run in the network process; refresh shortly after */
+    m->refresh_timer = g_timeout_add(400, cookie_refresh_later, m);
+}
+
+static void cookie_clear_all(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    CookieCtx *m = data;
+    GtkWidget *confirm = gtk_message_dialog_new(
+        GTK_WINDOW(m->win), GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_YES_NO,
+        "Delete all cookies?\n\nYou will be signed out of every site.");
+    gboolean yes = (gtk_dialog_run(GTK_DIALOG(confirm)) == GTK_RESPONSE_YES);
+    gtk_widget_destroy(confirm);
+    if (!yes)
+        return;
+    WebKitWebsiteDataManager *dm = webkit_web_context_get_website_data_manager(
+        webkit_web_context_get_default());
+    cookie_set_status(m, "Deleting…");
+    webkit_website_data_manager_clear(dm, WEBKIT_WEBSITE_DATA_COOKIES, 0,
+                                      NULL, NULL, NULL);
+    if (m->refresh_timer)
+        g_source_remove(m->refresh_timer);
+    m->refresh_timer = g_timeout_add(600, cookie_refresh_later, m);
+}
+
+static void cookie_export(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    CookieCtx *m = data;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Export cookies", GTK_WINDOW(m->win), GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), "cookies.txt");
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) != GTK_RESPONSE_ACCEPT) {
+        gtk_widget_destroy(chooser);
+        return;
+    }
+    char *file = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+
+    GString *out = g_string_new(
+        "# HTTP Cookie File\n"
+        "# https://curl.se/docs/http-cookies.html\n"
+        "# This file was generated by GtkBrowser.\n");
+    int n = 0;
+    for (GList *l = m->cookies; l; l = l->next) {
+        SoupCookie *c = l->data;
+        const char *site = soup_cookie_get_domain(c);
+        const char *path = soup_cookie_get_path(c);
+        GDateTime *exp = soup_cookie_get_expires(c);
+        g_string_append_printf(out, "%s\t%s\t%s\t%s\t%lld\t%s\t%s\n",
+                               site ? site : "",
+                               (site && site[0] == '.') ? "TRUE" : "FALSE",
+                               path ? path : "/",
+                               soup_cookie_get_secure(c) ? "TRUE" : "FALSE",
+                               exp ? (long long)g_date_time_to_unix(exp) : 0LL,
+                               soup_cookie_get_name(c),
+                               soup_cookie_get_value(c));
+        n++;
+    }
+    if (!g_file_set_contents(file, out->str, -1, NULL)) {
+        cookie_set_status(m, "Export failed: could not write file.");
+    } else {
+        char *base = g_path_get_basename(file);
+        char *msg = g_strdup_printf("Exported %d cookie%s to %s",
+                                    n, n == 1 ? "" : "s", base);
+        g_free(base);
+        cookie_set_status(m, msg);
+        g_free(msg);
+    }
+    g_free(file);
+    g_string_free(out, TRUE);
+}
+
+static void cookie_import(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    CookieCtx *m = data;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(
+        "Import cookies (cookies.txt)", GTK_WINDOW(m->win),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Import", GTK_RESPONSE_ACCEPT, NULL);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) != GTK_RESPONSE_ACCEPT) {
+        gtk_widget_destroy(chooser);
+        return;
+    }
+    char *file = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+
+    gchar *contents = NULL;
+    if (!g_file_get_contents(file, &contents, NULL, NULL)) {
+        cookie_set_status(m, "Import failed: could not read file.");
+        g_free(file);
+        return;
+    }
+    WebKitCookieManager *cm = cookie_manager_of(m->b);
+    char **lines = g_strsplit(contents, "\n", -1);
+    int added = 0;
+    for (int i = 0; lines[i]; i++) {
+        char *line = g_strchomp(lines[i]);
+        if (!*line || line[0] == '#')
+            continue;
+        char **f = g_strsplit(line, "\t", 7);
+        if (g_strv_length(f) != 7 || !f[5][0]) {
+            g_strfreev(f);
+            continue;
+        }
+        /* Netscape format: domain flag path secure expiry name value */
+        long long exp = g_ascii_strtoll(f[4], NULL, 10);
+        SoupCookie *c = soup_cookie_new(f[5], f[6], f[0], f[2],
+                                        exp > 0 ? (int)(exp - time(NULL)) : -1);
+        if (exp > 0)
+            soup_cookie_set_expires(c, g_date_time_new_from_unix_utc(exp));
+        soup_cookie_set_secure(c, g_ascii_strcasecmp(f[3], "TRUE") == 0);
+        webkit_cookie_manager_add_cookie(cm, c, NULL, NULL, NULL);
+        soup_cookie_free(c); /* converted synchronously by WebKit */
+        added++;
+        g_strfreev(f);
+    }
+    g_strfreev(lines);
+    g_free(contents);
+    char *base = g_path_get_basename(file);
+    char *msg = g_strdup_printf("Imported %d cookie%s from %s",
+                                added, added == 1 ? "" : "s", base);
+    g_free(base);
+    g_free(file);
+    cookie_set_status(m, msg);
+    g_free(msg);
+    if (m->refresh_timer)
+        g_source_remove(m->refresh_timer);
+    m->refresh_timer = g_timeout_add(600, cookie_refresh_later, m);
+}
+
+static void on_cookie_dialog_destroy(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    CookieCtx *m = data;
+    m->win = NULL; /* pending async callbacks are guarded by this */
+    if (m->refresh_timer)
+        g_source_remove(m->refresh_timer);
+    if (!m->loading) { /* otherwise on_cookies_fetched() frees it */
+        cookie_free_list(m->cookies);
+        g_free(m);
+    }
+}
+
+static void on_manage_cookies_clicked(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    CookieCtx *m = g_new0(CookieCtx, 1);
+    m->b = b;
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    m->win = win;
+    gtk_window_set_title(GTK_WINDOW(win), "Cookies");
+    gtk_window_set_default_size(GTK_WINDOW(win), 840, 540);
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(win_toplevel(b)));
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+    g_signal_connect(win, "destroy", G_CALLBACK(on_cookie_dialog_destroy), m);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 8);
+    gtk_container_add(GTK_CONTAINER(win), vbox);
+
+    m->store = gtk_list_store_new(7, G_TYPE_STRING, G_TYPE_STRING,
+                                  G_TYPE_STRING, G_TYPE_STRING,
+                                  G_TYPE_STRING, G_TYPE_STRING,
+                                  G_TYPE_POINTER);
+    m->tv = GTK_TREE_VIEW(gtk_tree_view_new_with_model(GTK_TREE_MODEL(m->store)));
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(m->tv)),
+                                GTK_SELECTION_MULTIPLE);
+    const char *cols[] = { "Site", "Name", "Value", "Expires", "Flags", "Shared" };
+    for (int i = 0; i < 6; i++) {
+        GtkCellRenderer *r = gtk_cell_renderer_text_new();
+        GtkTreeViewColumn *c = gtk_tree_view_column_new_with_attributes(
+            cols[i], r, "text", i, NULL);
+        if (i == 0 || i == 1)
+            gtk_tree_view_column_set_expand(c, TRUE);
+        gtk_tree_view_append_column(GTK_TREE_VIEW(m->tv), c);
+    }
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_set_border_width(GTK_CONTAINER(sw), 6);
+    gtk_container_add(GTK_CONTAINER(sw), GTK_WIDGET(m->tv));
+    gtk_box_pack_start(GTK_BOX(vbox), sw, TRUE, TRUE, 0);
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    m->shared_only = gtk_check_button_new_with_label(
+        "Show shared (third-party) cookies only");
+    gtk_widget_set_tooltip_text(m->shared_only,
+        "\"Shared\" = the cookie was set by a site other than the one you "
+        "are browsing, so it follows you across sites.");
+    g_signal_connect(m->shared_only, "toggled", G_CALLBACK(on_shared_only_toggled), m);
+    GtkWidget *refresh_btn = gtk_button_new_with_label("_Refresh");
+    g_signal_connect(refresh_btn, "clicked", G_CALLBACK(on_cookie_refresh_clicked), m);
+    GtkWidget *del_btn = gtk_button_new_with_label("Delete selected");
+    g_signal_connect(del_btn, "clicked", G_CALLBACK(cookie_delete_selected), m);
+    GtkWidget *clear_btn = gtk_button_new_with_label("Clear all…");
+    g_signal_connect(clear_btn, "clicked", G_CALLBACK(cookie_clear_all), m);
+    GtkWidget *export_btn = gtk_button_new_with_label("Export…");
+    g_signal_connect(export_btn, "clicked", G_CALLBACK(cookie_export), m);
+    GtkWidget *import_btn = gtk_button_new_with_label("Import…");
+    g_signal_connect(import_btn, "clicked", G_CALLBACK(cookie_import), m);
+    gtk_box_pack_start(GTK_BOX(row), m->shared_only, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), refresh_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), del_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), clear_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), export_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), import_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), row, FALSE, FALSE, 0);
+
+    m->status = gtk_label_new("Loading…");
+    gtk_widget_set_halign(m->status, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(vbox), m->status, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(win);
+    cookie_refresh(m);
+    gtk_widget_grab_focus(win_toplevel(b));
+}
+
 static void on_settings_clicked(GtkButton *btn, Browser *b)
 {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Settings",
@@ -1860,6 +2330,15 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     g_signal_connect(manage_btn, "clicked", G_CALLBACK(on_manage_history_clicked), b);
     gtk_box_pack_start(GTK_BOX(content), manage_btn, FALSE, FALSE, 0);
 
+    GtkWidget *tpc_check = gtk_check_button_new_with_label(
+        "Block third-party (shared) cookies");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tpc_check), b->block_third_party);
+    gtk_widget_set_halign(tpc_check, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), tpc_check, FALSE, FALSE, 0);
+    GtkWidget *manage_cookies_btn = gtk_button_new_with_label("Manage cookies…");
+    gtk_widget_set_halign(manage_cookies_btn, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(content), manage_cookies_btn, FALSE, FALSE, 0);
+
     kp_build_settings_section(b, content);
 
     g_signal_connect(adblock_check, "toggled", G_CALLBACK(on_adblock_toggled), b);
@@ -1870,6 +2349,10 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     g_signal_connect(restore_check, "toggled", G_CALLBACK(on_restore_toggled), b);
     g_signal_connect(hide_tabbar_check, "toggled",
                      G_CALLBACK(on_hide_tabbar_toggled), b);
+    g_signal_connect(tpc_check, "toggled",
+                     G_CALLBACK(on_block_third_party_toggled), b);
+    g_signal_connect(manage_cookies_btn, "clicked",
+                     G_CALLBACK(on_manage_cookies_clicked), b);
 
     gtk_widget_show_all(dialog);
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
@@ -1938,6 +2421,9 @@ static void load_settings(Browser *b)
         if (g_key_file_has_key(kf, "general", "hide_tabbar", NULL))
             b->hide_tabbar =
                 g_key_file_get_integer(kf, "general", "hide_tabbar", NULL) != 0;
+        if (g_key_file_has_key(kf, "cookies", "block_third_party", NULL))
+            b->block_third_party =
+                g_key_file_get_integer(kf, "cookies", "block_third_party", NULL) != 0;
         b->home_url = g_key_file_get_string(kf, "general", "home", NULL);
         b->new_tab_url = g_key_file_get_string(kf, "general", "newtab", NULL);
         b->user_agent = g_key_file_get_string(kf, "general", "user_agent", NULL);
@@ -1970,6 +2456,8 @@ static void save_settings(Browser *b)
                            b->restore_session ? 1 : 0);
     g_key_file_set_integer(kf, "general", "hide_tabbar",
                            b->hide_tabbar ? 1 : 0);
+    g_key_file_set_integer(kf, "cookies", "block_third_party",
+                           b->block_third_party ? 1 : 0);
     char *path = settings_path();
     char *dir = g_path_get_dirname(path);
     g_mkdir_with_parents(dir, 0700);
@@ -3739,6 +4227,7 @@ int main(int argc, char *argv[])
     b->restore_session = TRUE;
     b->hide_tabbar = TRUE;
     load_settings(b);
+    apply_cookie_policy(b);
     load_history(b);
     load_bookmarks(b);
 
