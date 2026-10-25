@@ -6060,7 +6060,7 @@ static Win *new_window(Browser *b)
                      G_CALLBACK(on_bookmarks_clicked), b);
     gtk_box_pack_start(GTK_BOX(toolbar), win->bookmarks_button, FALSE, FALSE, 0);
 
-    win->downloads_button = gtk_button_new_from_icon_name("folder-download",
+    win->downloads_button = gtk_button_new_from_icon_name("browser-download",
                                                           GTK_ICON_SIZE_LARGE_TOOLBAR);
     gtk_widget_set_tooltip_text(win->downloads_button,
                                 "Downloads — recent files and their progress");
