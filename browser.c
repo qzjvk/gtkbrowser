@@ -162,6 +162,7 @@ typedef struct Tab {
     GtkWidget *icon_image;
     GtkWidget *title_label;
     GtkWidget *tab_label;    /* the tab's label box (icon + title + close) */
+    GtkWidget *start_scroll; /* scrolled window around the start page */
     GtkWidget *start_page;   /* built-in GTK start page (home) */
     gboolean on_start_page;  /* start page is currently shown in this tab */
     gchar *source_file;      /* temp file behind a Ctrl+U view-source load */
@@ -2028,9 +2029,19 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     gtk_box_pack_start(GTK_BOX(label_box), close_btn, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(page), GTK_WIDGET(view), TRUE, TRUE, 0);
-    /* the built-in start page lives next to the view; only one is shown */
+    /* the built-in start page lives next to the view; only one is shown.
+     * It sits in a scrolled window so its content (search box, tile grids)
+     * doesn't drive the window's minimum height: in a short window the start
+     * page scrolls instead of forcing the window taller. Horizontal scrolling
+     * is off — the tiles reflow to the window width instead. */
     tab->start_page = start_page_build(tab);
-    gtk_box_pack_start(GTK_BOX(page), tab->start_page, TRUE, TRUE, 0);
+    tab->start_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(tab->start_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(tab->start_scroll),
+                                        GTK_SHADOW_NONE);
+    gtk_container_add(GTK_CONTAINER(tab->start_scroll), tab->start_page);
+    gtk_box_pack_start(GTK_BOX(page), tab->start_scroll, TRUE, TRUE, 0);
 
     g_object_set_data_full(G_OBJECT(page), "tab", tab, (GDestroyNotify)tab_destroy);
     gtk_notebook_append_page(GTK_NOTEBOOK(win->notebook), page, label_box);
@@ -2046,7 +2057,7 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     gtk_widget_show_all(label_box);
     /* hidden until the tab is on home (same show-all-then-hide trick as
      * the find bar in new_window) */
-    gtk_widget_hide(tab->start_page);
+    gtk_widget_hide(tab->start_scroll);
 
     g_signal_connect(view, "load-changed", G_CALLBACK(on_load_changed), tab);
     g_signal_connect(view, "notify::title", G_CALLBACK(on_notify_title), tab);
@@ -2217,7 +2228,11 @@ static void start_page_refresh(Tab *tab)
         gtk_box_pack_start(GTK_BOX(sites), hdr, FALSE, FALSE, 0);
         GtkWidget *grid = gtk_flow_box_new();
         gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(grid), GTK_SELECTION_NONE);
-        gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 3);
+        /* min 1 (not 3): a 3-tile floor made the grid's minimum width ~500px, which
+         * would pin the window's minimum width on the start page. Wide
+         * windows still get 6 tiles per row (max above); narrow ones simply
+         * reflow to fewer per row. */
+        gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 1);
         gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(grid), 6);
         gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
         gtk_widget_set_margin_bottom(grid, 6);
@@ -2255,7 +2270,7 @@ static void start_page_refresh(Tab *tab)
             gtk_box_pack_start(GTK_BOX(sites), hdr, FALSE, FALSE, 0);
             GtkWidget *grid = gtk_flow_box_new();
             gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(grid), GTK_SELECTION_NONE);
-            gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 3);
+            gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 1);
             gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(grid), 6);
             gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
             gtk_widget_set_margin_bottom(grid, 6);
@@ -2307,8 +2322,12 @@ static GtkWidget *start_page_build(Tab *tab)
     /* search box */
     GtkWidget *search = gtk_entry_new();
     gtk_widget_set_name(search, "start-search");
-    /* wide enough to read like a search bar (it shrinks in small windows) */
-    gtk_widget_set_size_request(search, 480, -1);
+    /* ~480px wide by default — max-width-chars is its natural width, and
+     * width-chars its minimum. (A size_request would have made 480px the
+     * minimum and pinned the window's minimum width on the start page.)
+     * halign CENTER keeps it at natural width in wide windows. */
+    gtk_entry_set_width_chars(GTK_ENTRY(search), 6);
+    gtk_entry_set_max_width_chars(GTK_ENTRY(search), 44);
     gtk_entry_set_placeholder_text(GTK_ENTRY(search), "Search or enter address");
     gtk_style_context_add_class(gtk_widget_get_style_context(search), "start-search");
     gtk_widget_set_halign(search, GTK_ALIGN_CENTER);
@@ -2347,7 +2366,7 @@ static void start_page_show(Tab *tab)
     start_page_refresh(tab);
     tab->on_start_page = TRUE;
     gtk_widget_hide(GTK_WIDGET(tab->view));
-    gtk_widget_show_all(tab->start_page);
+    gtk_widget_show_all(tab->start_scroll);
     gtk_label_set_text(GTK_LABEL(tab->title_label), "Home");
     gtk_widget_set_tooltip_text(tab->title_label, "Home");
     const char *display = (home_kind(b) == HOME_KIND_FILE) ? b->home_file : "";
@@ -2366,7 +2385,7 @@ static void start_page_hide(Tab *tab)
     if (!tab->on_start_page)
         return;
     tab->on_start_page = FALSE;
-    gtk_widget_hide(tab->start_page);
+    gtk_widget_hide(tab->start_scroll);
     gtk_widget_show(GTK_WIDGET(tab->view));
     const char *title = webkit_web_view_get_title(tab->view);
     const char *uri = webkit_web_view_get_uri(tab->view);
@@ -5982,6 +6001,13 @@ static Win *new_window(Browser *b)
     gtk_entry_set_placeholder_text(GTK_ENTRY(win->url_entry), "Search or enter address");
     gtk_widget_set_hexpand(win->url_entry, TRUE);
     gtk_widget_set_tooltip_text(win->url_entry, "Ctrl+L to focus");
+    /* GTK3 gives every entry a ~150px built-in minimum width (MIN_ENTRY_WIDTH
+     * in gtkentry.c; ~168px with padding/border in most themes, and CSS
+     * min-width cannot lower it). That floor, added to the toolbar buttons,
+     * pinned the window's minimum width to the full toolbar, so the window
+     * could not be resized much narrower. width-chars 0 lets the entry shrink
+     * down to just its padlock icon; it still expands to fill the toolbar. */
+    gtk_entry_set_width_chars(GTK_ENTRY(win->url_entry), 0);
     GtkEntryCompletion *completion = gtk_entry_completion_new();
     gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(b->url_model));
     gtk_entry_completion_set_text_column(completion, 0);
