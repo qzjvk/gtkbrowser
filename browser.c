@@ -1910,7 +1910,8 @@ static void cookie_reload(CookieCtx *m)
 static void on_cookies_fetched(GObject *manager, GAsyncResult *res, gpointer data)
 {
     CookieCtx *m = data;
-    g_assert(!m->loading);
+    /* loading was set by cookie_refresh() while this fetch was in flight */
+    g_assert(m->loading);
     GError *err = NULL;
     GList *list = webkit_cookie_manager_get_all_cookies_finish(
         WEBKIT_COOKIE_MANAGER(manager), res, &err);
