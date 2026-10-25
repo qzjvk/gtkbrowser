@@ -93,6 +93,8 @@ struct Browser {
     int search_engine;       /* index into SEARCH_ENGINES */
     gchar *custom_search_base; /* "Custom" engine URL template */
     gchar *home_url;         /* Ctrl+H target (settings) */
+    gchar *home_file;        /* custom home page: local HTML file (settings);
+                               re-read from disk on every home visit */
     gchar *new_tab_url;      /* page for new tabs (settings) */
     int default_zoom;        /* percent, applied to new tabs */
     gchar *user_agent;       /* custom user agent (settings) */
@@ -111,6 +113,7 @@ struct Win {
     GtkWidget *back_button;
     GtkWidget *forward_button;
     GtkWidget *reload_button;
+    GtkWidget *home_button;
     GtkWidget *progress;
     GtkWidget *blocked_button;
     GtkWidget *blocked_label;
@@ -133,6 +136,8 @@ typedef struct Tab {
     GtkWidget *icon_image;
     GtkWidget *title_label;
     GtkWidget *tab_label;    /* the tab's label box (icon + title + close) */
+    GtkWidget *start_page;   /* built-in GTK start page (home) */
+    gboolean on_start_page;  /* start page is currently shown in this tab */
     gchar *source_file;      /* temp file behind a Ctrl+U view-source load */
     /* pending drag & drop state; see the "drag & drop" section */
     GdkDragContext *drop_ctx;     /* drag currently over the view (ref) */
@@ -166,6 +171,10 @@ static void update_tabbar(Win *win);
 static void tab_destroy(Tab *tab);
 static GtkWidget *new_tab(Win *win, const char *uri);
 static void close_tab(Win *win, GtkWidget *page);
+static GtkWidget *start_page_build(Tab *tab);
+static void start_page_show(Tab *tab);
+static void start_page_hide(Tab *tab);
+static void home_goto(Win *win);
 static void update_url_entry(Win *win, Tab *tab);
 static void update_nav_buttons(Win *win, Tab *tab);
 static void update_window_title(Win *win, Tab *tab);
@@ -176,14 +185,18 @@ static void fill_login(Browser *b);
 static void choose_kp_database(GtkButton *btn, Browser *b);
 static void kp_build_settings_section(Browser *b, GtkWidget *content);
 static void on_blocked_clicked(GtkButton *btn, Browser *b);
+static gboolean is_web_uri(const char *uri);
 static void history_add(Browser *b, const char *uri);
 static void refresh_url_model(Browser *b);
+static gboolean on_bookmark_row_press(GtkWidget *row, GdkEventButton *e,
+                                      Browser *b);
 static void bookmark_toggle(Browser *b, const char *uri, const char *title);
 static void cycle_tab(Win *win, int delta);
 static void on_engine_changed(GtkComboBox *combo, Browser *b);
 static void on_custom_search_changed(GtkEntry *entry, Browser *b);
 static void on_home_changed(GtkEntry *entry, Browser *b);
 static void on_new_tab_url_changed(GtkEntry *entry, Browser *b);
+static void home_update_labels(GtkWidget *from, Browser *b);
 static void on_zoom_changed(GtkSpinButton *spin, Browser *b);
 static void on_user_agent_changed(GtkEntry *entry, Browser *b);
 static void on_blocklist_browse(GtkButton *btn, Browser *b);
@@ -241,6 +254,46 @@ static char *normalize_uri(const char *s)
     if (has_known_scheme(s))
         return g_strdup(s);
     return g_strdup_printf("https://%s", s);
+}
+
+/* What "home" resolves to. Precedence: a custom local HTML file (the
+ * user's own page, Settings), then the home page URL, then the built-in
+ * GTK start page (search box + bookmarks + recent sites). */
+typedef enum { HOME_KIND_BUILTIN, HOME_KIND_URL, HOME_KIND_FILE } HomeKind;
+
+static HomeKind home_kind(Browser *b)
+{
+    if (b->home_file && *b->home_file)
+        return HOME_KIND_FILE;
+    if (b->home_url && *b->home_url)
+        return HOME_KIND_URL;
+    return HOME_KIND_BUILTIN;
+}
+
+/* The custom home file as a file:// URI (the path is absolute, so this
+ * yields the correct "file:///path" form). */
+static char *home_file_uri(Browser *b)
+{
+    return g_strdup_printf("file://%s", b->home_file);
+}
+
+/* The URI home navigation loads for HOME_URL / HOME_FILE kinds. */
+static char *home_target_uri(Browser *b)
+{
+    if (b->home_file && *b->home_file)
+        return home_file_uri(b);
+    const char *u = b->home_url && *b->home_url ? b->home_url : HOME_URL;
+    return normalize_uri(u);
+}
+
+static gboolean home_file_matches_uri(Browser *b, const char *uri)
+{
+    if (!b->home_file || !uri)
+        return FALSE;
+    char *expected = home_file_uri(b);
+    gboolean m = g_strcmp0(expected, uri) == 0;
+    g_free(expected);
+    return m;
 }
 
 static gboolean looks_like_url(const char *s)
@@ -853,6 +906,16 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab
 {
     Win *win = tab->win;
     Browser *b = win->browser;
+    if (tab->on_start_page &&
+        (event == WEBKIT_LOAD_STARTED || event == WEBKIT_LOAD_FINISHED)) {
+        /* Any navigation away from the custom home file hides the start
+         * page; landing back on it (re-home) refreshes and re-shows it. */
+        const char *uri = webkit_web_view_get_uri(view);
+        if (uri && home_file_matches_uri(b, uri))
+            start_page_show(tab);
+        else
+            start_page_hide(tab);
+    }
     if (event == WEBKIT_LOAD_FINISHED) {
         const char *uri = webkit_web_view_get_uri(view);
         drop_source_file(tab, uri);
@@ -1035,6 +1098,9 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     gtk_box_pack_start(GTK_BOX(label_box), close_btn, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(page), GTK_WIDGET(view), TRUE, TRUE, 0);
+    /* the built-in start page lives next to the view; only one is shown */
+    tab->start_page = start_page_build(tab);
+    gtk_box_pack_start(GTK_BOX(page), tab->start_page, TRUE, TRUE, 0);
 
     g_object_set_data_full(G_OBJECT(page), "tab", tab, (GDestroyNotify)tab_destroy);
     gtk_notebook_append_page(GTK_NOTEBOOK(win->notebook), page, label_box);
@@ -1048,6 +1114,9 @@ static GtkWidget *new_tab(Win *win, const char *uri)
      * Same for the page contents of tabs created after startup. */
     gtk_widget_show_all(page);
     gtk_widget_show_all(label_box);
+    /* hidden until the tab is on home (same show-all-then-hide trick as
+     * the find bar in new_window) */
+    gtk_widget_hide(tab->start_page);
 
     g_signal_connect(view, "load-changed", G_CALLBACK(on_load_changed), tab);
     g_signal_connect(view, "notify::title", G_CALLBACK(on_notify_title), tab);
@@ -1066,12 +1135,19 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     g_signal_connect_swapped(close_btn, "clicked", G_CALLBACK(on_tab_close_clicked), page);
     g_signal_connect(label_box, "button-press-event", G_CALLBACK(on_tab_button_press), page);
 
+    /* Explicit URL wins; then the configured new-tab page; then the home
+     * target — except the built-in home needs no load: the start page
+     * (GTK widgets) is shown instead of the web view. */
     const char *start_url = uri && *uri ? uri
                                         : (b->new_tab_url && *b->new_tab_url
-                                           ? b->new_tab_url : HOME_URL);
-    char *load_uri_str = normalize_uri(start_url);
-    webkit_web_view_load_uri(view, load_uri_str);
-    g_free(load_uri_str);
+                                           ? b->new_tab_url
+                                           : (home_kind(b) == HOME_KIND_BUILTIN
+                                              ? NULL : home_target_uri(b)));
+    if (start_url) {
+        char *load_uri_str = normalize_uri(start_url);
+        webkit_web_view_load_uri(view, load_uri_str);
+        g_free(load_uri_str);
+    }
 
     gtk_notebook_set_current_page(GTK_NOTEBOOK(win->notebook),
                                   gtk_notebook_page_num(GTK_NOTEBOOK(win->notebook), page));
@@ -1079,10 +1155,320 @@ static GtkWidget *new_tab(Win *win, const char *uri)
     update_url_entry(win, tab);
     update_nav_buttons(win, tab);
     update_window_title(win, tab);
-    /* give the new tab's view the input focus so its text caret is drawn;
-     * a WebKit view that never receives a focus-in doesn't blink its caret */
-    gtk_widget_grab_focus(GTK_WIDGET(view));
+
+    if (!start_url || home_file_matches_uri(b, start_url)) {
+        /* the tab starts on home: show the start page and focus its search
+         * box (the web view is hidden, so its caret doesn't matter) */
+        start_page_show(tab);
+        GtkWidget *search = find_named(tab->start_page, "start-search");
+        if (search)
+            gtk_widget_grab_focus(search);
+    } else {
+        /* give the new tab's view the input focus so its text caret is
+         * drawn; a WebKit view that never receives a focus-in doesn't
+         * blink its caret */
+        gtk_widget_grab_focus(GTK_WIDGET(view));
+    }
     return page;
+}
+
+/* ---------- start page (built-in GTK home) ----------
+ * Shown in a tab instead of the web view when the tab is on the built-in
+ * home (no custom home file or URL configured). A search box on top, then
+ * tiles for bookmarks and recent sites; a tile opens a new tab so the
+ * start page stays, like a browser's normal start page. */
+
+#define START_PAGE_MAX_SITES 12
+
+/* The host part of a URI, for the recent-sites tiles (history keeps no
+ * titles). */
+static char *uri_host_label(const char *uri)
+{
+    const char *p = uri;
+    if (strstr(p, "://"))
+        p = strchr(p, ':') + 2;
+    const char *end = strchr(p, '/');
+    return g_strndup(p, end ? (gsize)(end - p) : strlen(p));
+}
+
+static void on_start_search_activated(GtkEntry *entry, Tab *tab)
+{
+    Browser *b = tab->win->browser;
+    const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
+    if (!text || !*text)
+        return;
+    if (looks_like_url(text)) {
+        char *uri = normalize_uri(text);
+        if (home_file_matches_uri(b, uri))
+            start_page_show(tab);
+        else
+            webkit_web_view_load_uri(tab->view, uri);
+        g_free(uri);
+    } else {
+        char *q = g_uri_escape_string(text, NULL, TRUE);
+        char *url = build_search_url(search_template(b), q);
+        g_free(q);
+        webkit_web_view_load_uri(tab->view, url);
+        g_free(url);
+    }
+}
+
+/* Tiles open a new tab; the start page stays (like a browser start page). */
+static void on_start_tile_clicked(GtkButton *btn, Tab *tab)
+{
+    (void)btn;
+    const char *uri = g_object_get_data(G_OBJECT(btn), "uri");
+    if (uri)
+        new_tab(tab->win, uri);
+}
+
+static void start_tile_add(GtkWidget *grid, const char *uri, const char *title,
+                           const char *icon, Tab *tab)
+{
+    GtkWidget *btn = gtk_button_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn), "flat");
+    gtk_style_context_add_class(gtk_widget_get_style_context(btn), "start-tile");
+    gtk_widget_set_tooltip_text(btn, uri);
+    /* fixed tile size: without it the flowbox stretches each child and
+     * collapses the grid to one tile per row */
+    gtk_widget_set_size_request(btn, 160, -1);
+    gtk_widget_set_halign(btn, GTK_ALIGN_CENTER);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_halign(box, GTK_ALIGN_CENTER);
+    GtkWidget *img = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_DND);
+    GtkWidget *lbl = gtk_label_new(title && *title ? title : uri);
+    gtk_label_set_ellipsize(GTK_LABEL(lbl), PANGO_ELLIPSIZE_END);
+    gtk_label_set_width_chars(GTK_LABEL(lbl), 16);
+    gtk_label_set_max_width_chars(GTK_LABEL(lbl), 16);
+    GtkWidget *sub = gtk_label_new(uri);
+    gtk_label_set_ellipsize(GTK_LABEL(sub), PANGO_ELLIPSIZE_END);
+    gtk_label_set_width_chars(GTK_LABEL(sub), 16);
+    gtk_label_set_max_width_chars(GTK_LABEL(sub), 16);
+    gtk_style_context_add_class(gtk_widget_get_style_context(sub), "dim-label");
+    gtk_box_pack_start(GTK_BOX(box), img, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), sub, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(btn), box);
+    /* Copy the URI: the bookmark/history lists can change before the tile
+     * is clicked; the copy is freed with the button (tab destruction). */
+    g_object_set_data_full(G_OBJECT(btn), "uri", g_strdup(uri), g_free);
+    g_signal_connect(btn, "clicked", G_CALLBACK(on_start_tile_clicked), tab);
+    gtk_container_add(GTK_CONTAINER(grid), btn);
+}
+
+/* Rebuild the tile grid: bookmarks first, then the recent unique sites. */
+static void start_page_refresh(Tab *tab)
+{
+    if (!tab->start_page)
+        return;
+    Browser *b = tab->win->browser;
+    GtkWidget *sites = find_named(tab->start_page, "start-sites");
+    GtkWidget *hint = find_named(tab->start_page, "start-hint");
+    if (!sites)
+        return;
+
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(sites));
+    for (GList *l = rows; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(rows);
+
+    gboolean any = FALSE;
+    if (b->bookmarks && b->bookmarks->len) {
+        GtkWidget *hdr = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(hdr), "<b>Bookmarks</b>");
+        gtk_widget_set_halign(hdr, GTK_ALIGN_CENTER);
+        gtk_widget_set_margin_top(hdr, 12);
+        gtk_box_pack_start(GTK_BOX(sites), hdr, FALSE, FALSE, 0);
+        GtkWidget *grid = gtk_flow_box_new();
+        gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(grid), GTK_SELECTION_NONE);
+        gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 3);
+        gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(grid), 6);
+        gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
+        gtk_widget_set_margin_bottom(grid, 6);
+        for (guint i = 0; i < b->bookmarks->len; i++) {
+            Bookmark *bm = g_ptr_array_index(b->bookmarks, i);
+            start_tile_add(grid, bm->uri, bm->title, "starred", tab);
+        }
+        gtk_box_pack_start(GTK_BOX(sites), grid, FALSE, FALSE, 0);
+        any = TRUE;
+    }
+    if (b->history) {
+        GPtrArray *seen = g_ptr_array_new_with_free_func(g_free);
+        GPtrArray *recent = g_ptr_array_new();
+        for (guint i = 0; i < b->history->len &&
+                            recent->len < START_PAGE_MAX_SITES; i++) {
+            const char *u = g_ptr_array_index(b->history, i);
+            if (!is_web_uri(u))
+                continue;
+            gboolean dup = FALSE;
+            for (guint j = 0; j < seen->len; j++)
+                if (g_strcmp0(g_ptr_array_index(seen, j), u) == 0) {
+                    dup = TRUE;
+                    break;
+                }
+            if (dup)
+                continue;
+            g_ptr_array_add(seen, g_strdup(u));
+            g_ptr_array_add(recent, (gpointer)u); /* borrowed from b->history */
+        }
+        if (recent->len > 0) {
+            GtkWidget *hdr = gtk_label_new(NULL);
+            gtk_label_set_markup(GTK_LABEL(hdr), "<b>Recent</b>");
+            gtk_widget_set_halign(hdr, GTK_ALIGN_CENTER);
+            gtk_widget_set_margin_top(hdr, 12);
+            gtk_box_pack_start(GTK_BOX(sites), hdr, FALSE, FALSE, 0);
+            GtkWidget *grid = gtk_flow_box_new();
+            gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(grid), GTK_SELECTION_NONE);
+            gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(grid), 3);
+            gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(grid), 6);
+            gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
+            gtk_widget_set_margin_bottom(grid, 6);
+            for (guint i = 0; i < recent->len; i++) {
+                const char *u = g_ptr_array_index(recent, i);
+                char *host = uri_host_label(u);
+                start_tile_add(grid, u, host, "web-browser", tab);
+                g_free(host);
+            }
+            gtk_box_pack_start(GTK_BOX(sites), grid, FALSE, FALSE, 0);
+            any = TRUE;
+        }
+        g_ptr_array_unref(seen);
+        g_ptr_array_unref(recent);
+    }
+    if (hint) {
+        if (any)
+            gtk_widget_hide(hint);
+        else {
+            gtk_label_set_text(GTK_LABEL(hint),
+                "No bookmarks yet — press Ctrl+D on a page to add one. "
+                "Sites you visit show up here.");
+            gtk_widget_show(hint);
+        }
+    }
+}
+
+static GtkWidget *start_page_build(Tab *tab)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(page), "start-page");
+
+    /* header: app name + one-liner */
+    GtkWidget *head = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_halign(head, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(head, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(head, 48);
+    GtkWidget *title = gtk_label_new(NULL);
+    char *markup = g_strdup_printf(
+        "<span size=\"xx-large\" weight=\"bold\">" APP_NAME "</span>");
+    gtk_label_set_markup(GTK_LABEL(title), markup);
+    g_free(markup);
+    GtkWidget *sub = gtk_label_new("Search the web, or pick a site below");
+    gtk_style_context_add_class(gtk_widget_get_style_context(sub), "dim-label");
+    gtk_box_pack_start(GTK_BOX(head), title, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(head), sub, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), head, FALSE, FALSE, 0);
+
+    /* search box */
+    GtkWidget *search = gtk_entry_new();
+    gtk_widget_set_name(search, "start-search");
+    /* wide enough to read like a search bar (it shrinks in small windows) */
+    gtk_widget_set_size_request(search, 480, -1);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(search), "Search or enter address");
+    gtk_style_context_add_class(gtk_widget_get_style_context(search), "start-search");
+    gtk_widget_set_halign(search, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(search, 18);
+    gtk_widget_set_margin_start(search, 12);
+    gtk_widget_set_margin_end(search, 12);
+    g_signal_connect(search, "activate", G_CALLBACK(on_start_search_activated), tab);
+    gtk_box_pack_start(GTK_BOX(page), search, FALSE, FALSE, 0);
+
+    /* bookmark / recent-site tiles, rebuilt each time the page is shown */
+    GtkWidget *sites = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_name(sites, "start-sites");
+    gtk_box_pack_start(GTK_BOX(page), sites, FALSE, FALSE, 0);
+
+    /* empty-state hint, shown only when there are no tiles */
+    GtkWidget *hint = gtk_label_new("");
+    gtk_widget_set_name(hint, "start-hint");
+    gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
+    gtk_widget_set_halign(hint, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(hint, 24);
+    gtk_widget_set_margin_bottom(hint, 12);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hint), "dim-label");
+    gtk_widget_set_no_show_all(hint, TRUE);
+    gtk_box_pack_start(GTK_BOX(page), hint, FALSE, FALSE, 0);
+
+    return page;
+}
+
+/* Show the start page in the tab (hides the web view). */
+static void start_page_show(Tab *tab)
+{
+    Win *win = tab->win;
+    Browser *b = win->browser;
+    if (!tab->start_page)
+        return;
+    start_page_refresh(tab);
+    tab->on_start_page = TRUE;
+    gtk_widget_hide(GTK_WIDGET(tab->view));
+    gtk_widget_show_all(tab->start_page);
+    gtk_label_set_text(GTK_LABEL(tab->title_label), "Home");
+    gtk_widget_set_tooltip_text(tab->title_label, "Home");
+    const char *display = (home_kind(b) == HOME_KIND_FILE) ? b->home_file : "";
+    gtk_entry_set_text(GTK_ENTRY(win->url_entry), display);
+    update_security_icon(win, display);
+    gtk_window_set_title(GTK_WINDOW(win->window), "Home — " APP_NAME);
+    update_nav_buttons(win, tab);
+    if (win->find_tab == tab)
+        find_close(win);
+}
+
+/* Hide the start page and restore the web view (any navigation). */
+static void start_page_hide(Tab *tab)
+{
+    Win *win = tab->win;
+    if (!tab->on_start_page)
+        return;
+    tab->on_start_page = FALSE;
+    gtk_widget_hide(tab->start_page);
+    gtk_widget_show(GTK_WIDGET(tab->view));
+    const char *title = webkit_web_view_get_title(tab->view);
+    const char *uri = webkit_web_view_get_uri(tab->view);
+    const char *text = (title && *title) ? title : (uri ? uri : "New Tab");
+    gtk_label_set_text(GTK_LABEL(tab->title_label), truncate_tab_title(text));
+    gtk_widget_set_tooltip_text(tab->title_label, text);
+    update_url_entry(win, tab);
+    update_nav_buttons(win, tab);
+    update_window_title(win, tab);
+}
+
+/* Ctrl+H / home button: go to the configured home. */
+static void home_goto(Win *win)
+{
+    Browser *b = win->browser;
+    Tab *tab = current_tab(win);
+    if (!tab)
+        return;
+    switch (home_kind(b)) {
+    case HOME_KIND_BUILTIN:
+        start_page_show(tab);
+        break;
+    case HOME_KIND_URL: {
+        char *uri = home_target_uri(b);
+        webkit_web_view_load_uri(tab->view, uri);
+        g_free(uri);
+        break;
+    }
+    case HOME_KIND_FILE: {
+        char *uri = home_target_uri(b);
+        if (g_strcmp0(webkit_web_view_get_uri(tab->view), uri) == 0)
+            start_page_show(tab); /* already there: refresh in place */
+        else
+            webkit_web_view_load_uri(tab->view, uri); /* load-changed re-shows */
+        g_free(uri);
+        break;
+    }
+    }
 }
 
 /* ---------- toolbar / entry handlers ---------- */
@@ -1523,6 +1909,7 @@ static void on_home_changed(GtkEntry *entry, Browser *b)
     g_free(b->home_url);
     b->home_url = (t && *t) ? g_strdup(t) : NULL;
     save_settings(b);
+    home_update_labels(GTK_WIDGET(entry), b);
 }
 
 static void on_new_tab_url_changed(GtkEntry *entry, Browser *b)
@@ -1531,6 +1918,7 @@ static void on_new_tab_url_changed(GtkEntry *entry, Browser *b)
     g_free(b->new_tab_url);
     b->new_tab_url = (t && *t) ? g_strdup(t) : NULL;
     save_settings(b);
+    home_update_labels(GTK_WIDGET(entry), b);
 }
 
 static void tab_apply_zoom(Tab *tab, gpointer data)
@@ -1591,6 +1979,109 @@ static void on_blocklist_browse(GtkButton *btn, Browser *b)
         gtk_label_set_text(GTK_LABEL(lbl), text);
         g_free(text);
     }
+}
+
+/* What the home button / Ctrl+H will show, for the settings label. */
+static char *home_display_text(Browser *b)
+{
+    if (home_kind(b) == HOME_KIND_FILE)
+        return g_strdup_printf("custom file %s", b->home_file);
+    if (home_kind(b) == HOME_KIND_URL)
+        return g_strdup("the home page URL above");
+    return g_strdup("the built-in start page");
+}
+
+/* What a new tab will show, for the settings label. */
+static char *newtab_display_text(Browser *b)
+{
+    if (b->new_tab_url && *b->new_tab_url)
+        return g_strdup("the new tab page URL above");
+    if (home_kind(b) == HOME_KIND_BUILTIN)
+        return g_strdup("the built-in start page");
+    return g_strdup("the home page");
+}
+
+/* Refresh the "Home: …" and "New tabs: …" labels in the settings dialog. */
+static void home_update_labels(GtkWidget *from, Browser *b)
+{
+    (void)from;
+    GtkWidget *dlg = gtk_widget_get_ancestor(from, GTK_TYPE_DIALOG);
+    GtkWidget *lbl;
+    char *desc, *text;
+
+    lbl = dlg ? find_named(dlg, "homefile-label") : NULL;
+    if (lbl) {
+        desc = home_display_text(b);
+        text = g_strdup_printf("Home: %s", desc);
+        gtk_label_set_text(GTK_LABEL(lbl), text);
+        g_free(text);
+        g_free(desc);
+    }
+    lbl = dlg ? find_named(dlg, "newtab-label") : NULL;
+    if (lbl) {
+        desc = newtab_display_text(b);
+        text = g_strdup_printf("New tabs: %s", desc);
+        gtk_label_set_text(GTK_LABEL(lbl), text);
+        g_free(text);
+        g_free(desc);
+    }
+}
+
+/* Pick a local HTML file as the custom home page. The file is re-read on
+ * every home visit, so the user can edit it live and see the result. */
+static void on_home_file_browse(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Choose home page file",
+                                                     GTK_WINDOW(win_toplevel(b)),
+                                                     GTK_FILE_CHOOSER_ACTION_OPEN,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     "_Open", GTK_RESPONSE_ACCEPT,
+                                                     NULL);
+    GtkFileFilter *html = gtk_file_filter_new();
+    gtk_file_filter_set_name(html, "HTML files");
+    gtk_file_filter_add_pattern(html, "*.html");
+    gtk_file_filter_add_pattern(html, "*.htm");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(chooser), html);
+    GtkFileFilter *all = gtk_file_filter_new();
+    gtk_file_filter_set_name(all, "All files");
+    gtk_file_filter_add_pattern(all, "*");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(chooser), all);
+    if (b->home_file && g_file_test(b->home_file, G_FILE_TEST_EXISTS))
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(chooser), b->home_file);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        g_free(b->home_file);
+        b->home_file = fn;
+        save_settings(b);
+    }
+    gtk_widget_destroy(chooser);
+    home_update_labels(GTK_WIDGET(btn), b);
+}
+
+/* Reset home and new tabs to the built-in start page: clear the custom
+ * home file, the home page URL, and the new tab page URL (and the URL
+ * entries, so the change shows at once). */
+static void on_home_builtin(GtkButton *btn, Browser *b)
+{
+    (void)btn;
+    g_free(b->home_url);
+    b->home_url = NULL;
+    g_free(b->home_file);
+    b->home_file = NULL;
+    g_free(b->new_tab_url);
+    b->new_tab_url = NULL;
+    GtkWidget *dlg = gtk_widget_get_ancestor(GTK_WIDGET(btn), GTK_TYPE_DIALOG);
+    if (dlg) {
+        GtkWidget *entry = find_named(dlg, "home-entry");
+        if (entry)
+            gtk_entry_set_text(GTK_ENTRY(entry), "");
+        entry = find_named(dlg, "newtab-entry");
+        if (entry)
+            gtk_entry_set_text(GTK_ENTRY(entry), "");
+    }
+    save_settings(b);
+    home_update_labels(GTK_WIDGET(btn), b);
 }
 
 static void on_restore_toggled(GtkToggleButton *btn, Browser *b)
@@ -2279,10 +2770,48 @@ static void on_settings_clicked(GtkButton *btn, Browser *b)
     gtk_widget_set_halign(gen_hdr, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(content), gen_hdr, FALSE, FALSE, 0);
 
-    setting_entry_row(content, "Home page:", b->home_url, HOME_URL,
-                      G_CALLBACK(on_home_changed), b);
-    setting_entry_row(content, "New tab page:", b->new_tab_url, HOME_URL,
-                      G_CALLBACK(on_new_tab_url_changed), b);
+    GtkWidget *home_entry = setting_entry_row(content, "Home page:",
+                                          b->home_url, HOME_URL,
+                                          G_CALLBACK(on_home_changed), b);
+    gtk_widget_set_name(home_entry, "home-entry");
+    GtkWidget *nt_entry = setting_entry_row(content, "New tab page:",
+                                            b->new_tab_url, HOME_URL,
+                                            G_CALLBACK(on_new_tab_url_changed), b);
+    gtk_widget_set_name(nt_entry, "newtab-entry");
+
+    char *hf_desc = home_display_text(b);
+    char *hf_text = g_strdup_printf("Home: %s", hf_desc);
+    GtkWidget *hf_lbl = gtk_label_new(hf_text);
+    gtk_widget_set_name(hf_lbl, "homefile-label");
+    gtk_widget_set_halign(hf_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(hf_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_pack_start(GTK_BOX(content), hf_lbl, FALSE, FALSE, 0);
+    g_free(hf_text);
+    g_free(hf_desc);
+    char *nt_desc = newtab_display_text(b);
+    char *nt_text = g_strdup_printf("New tabs: %s", nt_desc);
+    GtkWidget *nt_lbl = gtk_label_new(nt_text);
+    gtk_widget_set_name(nt_lbl, "newtab-label");
+    gtk_widget_set_halign(nt_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(nt_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_pack_start(GTK_BOX(content), nt_lbl, FALSE, FALSE, 0);
+    g_free(nt_text);
+    g_free(nt_desc);
+    GtkWidget *hf_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    GtkWidget *hf_btn = gtk_button_new_with_label("Choose home page file…");
+    gtk_widget_set_tooltip_text(hf_btn,
+        "Your own start page: an HTML file, re-read on every home visit so "
+        "edits show up immediately. Takes precedence over the home page URL.");
+    g_signal_connect(hf_btn, "clicked", G_CALLBACK(on_home_file_browse), b);
+    GtkWidget *hf_builtin = gtk_button_new_with_label("Use built-in start page");
+    gtk_widget_set_tooltip_text(hf_builtin,
+        "Clear the custom home file, the home page URL, and the new tab "
+        "page URL so the home button / Ctrl+H and new tabs show the "
+        "built-in GTK start page again.");
+    g_signal_connect(hf_builtin, "clicked", G_CALLBACK(on_home_builtin), b);
+    gtk_box_pack_start(GTK_BOX(hf_row), hf_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hf_row), hf_builtin, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(content), hf_row, FALSE, FALSE, 0);
 
     GtkWidget *restore_check = gtk_check_button_new_with_label(
         "Restore last session (reopen previous tabs)");
@@ -2426,6 +2955,7 @@ static void load_settings(Browser *b)
             b->block_third_party =
                 g_key_file_get_integer(kf, "cookies", "block_third_party", NULL) != 0;
         b->home_url = g_key_file_get_string(kf, "general", "home", NULL);
+        b->home_file = g_key_file_get_string(kf, "general", "home_file", NULL);
         b->new_tab_url = g_key_file_get_string(kf, "general", "newtab", NULL);
         b->user_agent = g_key_file_get_string(kf, "general", "user_agent", NULL);
         if (!b->blocklist_file)
@@ -2445,6 +2975,8 @@ static void save_settings(Browser *b)
         g_key_file_set_string(kf, "search", "custom", b->custom_search_base);
     if (b->home_url)
         g_key_file_set_string(kf, "general", "home", b->home_url);
+    if (b->home_file)
+        g_key_file_set_string(kf, "general", "home_file", b->home_file);
     if (b->new_tab_url)
         g_key_file_set_string(kf, "general", "newtab", b->new_tab_url);
     g_key_file_set_integer(kf, "general", "zoom",
@@ -3128,7 +3660,8 @@ static void build_bookmarks_list(Browser *b, GtkWidget *list)
         char *text = g_strdup_printf("%s\n%s", bm->title, bm->uri);
         gtk_label_set_text(GTK_LABEL(lbl), text);
         gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
-        gtk_label_set_selectable(GTK_LABEL(lbl), TRUE);
+        /* not selectable: a click must fall through to the row so it
+         * opens the bookmark (selectable labels eat the press) */
         g_free(text);
         gtk_widget_set_hexpand(lbl, TRUE);
         GtkWidget *remove = gtk_button_new_with_mnemonic("_Remove");
@@ -3138,6 +3671,8 @@ static void build_bookmarks_list(Browser *b, GtkWidget *list)
                                g_free);
         g_signal_connect(remove, "clicked",
                          G_CALLBACK(on_bookmark_remove_clicked), list);
+        g_signal_connect(row, "button-press-event",
+                          G_CALLBACK(on_bookmark_row_press), b);
         gtk_container_add(GTK_CONTAINER(list), row);
     }
 }
@@ -3154,17 +3689,40 @@ static void on_bookmark_remove_clicked(GtkButton *btn, gpointer list)
     }
 }
 
+/* Single click on a row opens the bookmark in a new tab and closes the
+ * dialog (the "Remove" button consumes its own click, so it is safe). */
+static gboolean on_bookmark_row_press(GtkWidget *row, GdkEventButton *e,
+                                      Browser *b)
+{
+    if (e->type != GDK_BUTTON_PRESS || e->button != 1)
+        return FALSE;
+    const char *uri = g_object_get_data(G_OBJECT(row), "uri");
+    if (!uri)
+        return FALSE;
+    Win *w = active_window(b);
+    if (w)
+        new_tab(w, uri);
+    GtkWidget *dlg = gtk_widget_get_ancestor(row, GTK_TYPE_DIALOG);
+    if (dlg)
+        gtk_dialog_response(GTK_DIALOG(dlg), GTK_RESPONSE_CLOSE);
+    return TRUE;
+}
+
+/* Enter on the focused row (row-activated) does the same. */
 static void on_bookmark_row_activated(GtkListBox *list, GtkListBoxRow *row,
                                       Browser *b)
 {
     (void)list;
     GtkWidget *inner = gtk_bin_get_child(GTK_BIN(row));
     char *uri = inner ? g_object_get_data(G_OBJECT(inner), "uri") : NULL;
-    if (uri) {
-        Win *w = active_window(b);
-        if (w)
-            new_tab(w, uri);
-    }
+    if (!uri)
+        return;
+    Win *w = active_window(b);
+    if (w)
+        new_tab(w, uri);
+    GtkWidget *dlg = gtk_widget_get_ancestor(GTK_WIDGET(row), GTK_TYPE_DIALOG);
+    if (dlg)
+        gtk_dialog_response(GTK_DIALOG(dlg), GTK_RESPONSE_CLOSE);
 }
 
 static void on_bookmarks_clicked(GtkButton *btn, Browser *b)
@@ -3178,7 +3736,7 @@ static void on_bookmarks_clicked(GtkButton *btn, Browser *b)
     gtk_container_set_border_width(GTK_CONTAINER(content), 12);
 
     GtkWidget *hint = gtk_label_new(
-        "Double-click a bookmark to open it in a new tab. "
+        "Click a bookmark to open it in a new tab. "
         "Ctrl+D toggles the current page.");
     gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
     gtk_box_pack_start(GTK_BOX(content), hint, FALSE, FALSE, 0);
@@ -3605,14 +4163,9 @@ static gboolean on_key_press(GtkWidget *w, GdkEventKey *event, Win *win)
         if (tab)
             webkit_web_view_reload(tab->view);
         return TRUE;
-    case GDK_KEY_h: {
-        const char *home = b->home_url && *b->home_url ? b->home_url : HOME_URL;
-        char *home_uri = normalize_uri(home);
-        if (tab)
-            webkit_web_view_load_uri(tab->view, home_uri);
-        g_free(home_uri);
+    case GDK_KEY_h:
+        home_goto(win);
         return TRUE;
-    }
     case GDK_KEY_plus:
     case GDK_KEY_equal:
         if (tab)
@@ -3894,6 +4447,7 @@ static void on_window_destroy(GtkWidget *w, Win *win)
     g_free(b->kp_db_path);
     g_free(b->custom_search_base);
     g_free(b->home_url);
+    g_free(b->home_file);
     g_free(b->new_tab_url);
     g_free(b->user_agent);
     g_free(b->blocklist_file);
@@ -3961,11 +4515,13 @@ static Win *new_window(Browser *b)
     win->back_button = gtk_button_new_from_icon_name("go-previous", GTK_ICON_SIZE_LARGE_TOOLBAR);
     win->forward_button = gtk_button_new_from_icon_name("go-next", GTK_ICON_SIZE_LARGE_TOOLBAR);
     win->reload_button = gtk_button_new_from_icon_name("view-refresh", GTK_ICON_SIZE_LARGE_TOOLBAR);
+    win->home_button = gtk_button_new_from_icon_name("go-home", GTK_ICON_SIZE_LARGE_TOOLBAR);
     gtk_widget_set_sensitive(win->back_button, FALSE);
     gtk_widget_set_sensitive(win->forward_button, FALSE);
     gtk_widget_set_tooltip_text(win->back_button, "Back");
     gtk_widget_set_tooltip_text(win->forward_button, "Forward");
     gtk_widget_set_tooltip_text(win->reload_button, "Reload / Stop (F5)");
+    gtk_widget_set_tooltip_text(win->home_button, "Home (Ctrl+H)");
 
     win->url_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(win->url_entry), "Search or enter address");
@@ -4003,6 +4559,7 @@ static Win *new_window(Browser *b)
     gtk_box_pack_start(GTK_BOX(toolbar), win->back_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), win->forward_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), win->reload_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->home_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), win->url_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), win->blocked_button, FALSE, FALSE, 0);
 
@@ -4075,6 +4632,8 @@ static Win *new_window(Browser *b)
     g_signal_connect(win->back_button, "clicked", G_CALLBACK(on_back_clicked), win);
     g_signal_connect(win->forward_button, "clicked", G_CALLBACK(on_forward_clicked), win);
     g_signal_connect(win->reload_button, "clicked", G_CALLBACK(on_reload_clicked), win);
+    g_signal_connect_swapped(win->home_button, "clicked",
+                             G_CALLBACK(home_goto), win);
     g_signal_connect(settings_button, "clicked", G_CALLBACK(on_settings_clicked), b);
     g_signal_connect(new_tab_button, "clicked", G_CALLBACK(on_new_tab_clicked), win);
     g_signal_connect(close_tab_button, "clicked", G_CALLBACK(on_close_tab_clicked), win);
@@ -4132,6 +4691,13 @@ static void apply_css(void)
         "notebook.single-tab header tab > * {"
         "  min-height: 0;"
         "  min-width: 0;"
+        "}"
+        "box.start-page {"
+        "  padding: 16px;"
+        "}"
+        "button.start-tile {"
+        "  padding: 10px 12px;"
+        "  border-radius: 8px;"
         "}";
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),

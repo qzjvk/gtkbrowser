@@ -51,9 +51,18 @@ Installs:
   (replaces WebKit's default menu)
 - Fullscreen: `F11`
 - Zoom: `Ctrl+=` / `Ctrl+-` / `Ctrl+0`; default zoom for new tabs in Settings
-- Home: `Ctrl+H`, reload: `F5` / `Ctrl+R`
+- Home: `Ctrl+H` or the home button in the toolbar, reload: `F5` / `Ctrl+R`.
+  Home resolves in this order: a **custom home page file** (your own local
+  `.html`, Settings → "Choose home page file…" — re-read on every visit, so
+  edits show up live), then the **home page URL** (Settings), then the
+  **built-in start page**: a GTK-rendered page with a search box, your
+  bookmarks, and your recent sites (a tile opens a new tab). New tabs load
+  the "New tab page:" URL from Settings when set, otherwise the built-in
+  start page (or your configured home page). Settings → "Use built-in
+  start page" clears the home file, home URL, and new tab URL so both the
+  home button and new tabs show the built-in start page
 - History and bookmarks: `Ctrl+D` toggles the current page; the star button
-  opens a bookmark panel (double-click a row to open it); Settings →
+  opens the bookmark panel (click a row to open it in a new tab); Settings →
   "Manage history and bookmarks" lets you open, delete, or clear entries
 - Session restore: previous session's tabs and windows are reopened at start
   (toggleable in Settings)
@@ -71,7 +80,8 @@ Installs:
   strip, or page) and it opens — in a new tab, or the current tab if the
   page accepts the drop. A dropped file is handed to the page when the page
   handles drops itself, otherwise it opens in a new tab
-- New tab page and custom user agent configurable in Settings
+- New tab page, home page (URL or custom HTML file), and custom user agent
+  configurable in Settings
 
 ## Notes
 
