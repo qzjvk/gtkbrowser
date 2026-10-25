@@ -174,6 +174,7 @@ static void close_tab(Win *win, GtkWidget *page);
 static GtkWidget *start_page_build(Tab *tab);
 static void start_page_show(Tab *tab);
 static void start_page_hide(Tab *tab);
+static void tab_fix_focus(Tab *tab);
 static void home_goto(Win *win);
 static void update_url_entry(Win *win, Tab *tab);
 static void update_nav_buttons(Win *win, Tab *tab);
@@ -911,9 +912,10 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, Tab *tab
         /* Any navigation away from the custom home file hides the start
          * page; landing back on it (re-home) refreshes and re-shows it. */
         const char *uri = webkit_web_view_get_uri(view);
-        if (uri && home_file_matches_uri(b, uri))
+        if (uri && home_file_matches_uri(b, uri)) {
             start_page_show(tab);
-        else
+            tab_fix_focus(tab);
+        } else
             start_page_hide(tab);
     }
     if (event == WEBKIT_LOAD_FINISHED) {
@@ -1442,6 +1444,24 @@ static void start_page_hide(Tab *tab)
     update_window_title(win, tab);
 }
 
+/* Make sure this tab's visible content holds the input focus. After a tab
+ * switch or the start page being shown over the view, the focus widget can
+ * be left on a hidden widget — no visible caret, and typing goes nowhere.
+ * Leaves the focus alone when a visible widget (URL bar, find bar, search
+ * box) already holds it. */
+static void tab_fix_focus(Tab *tab)
+{
+    Win *win = tab->win;
+    GtkWidget *fw = gtk_window_get_focus(GTK_WINDOW(win->window));
+    if (fw && gtk_widget_is_visible(fw))
+        return;
+    GtkWidget *want = tab->on_start_page
+        ? find_named(tab->start_page, "start-search")
+        : GTK_WIDGET(tab->view);
+    if (want)
+        gtk_widget_grab_focus(want);
+}
+
 /* Ctrl+H / home button: go to the configured home. */
 static void home_goto(Win *win)
 {
@@ -1452,6 +1472,7 @@ static void home_goto(Win *win)
     switch (home_kind(b)) {
     case HOME_KIND_BUILTIN:
         start_page_show(tab);
+        tab_fix_focus(tab);
         break;
     case HOME_KIND_URL: {
         char *uri = home_target_uri(b);
@@ -1461,9 +1482,10 @@ static void home_goto(Win *win)
     }
     case HOME_KIND_FILE: {
         char *uri = home_target_uri(b);
-        if (g_strcmp0(webkit_web_view_get_uri(tab->view), uri) == 0)
+        if (g_strcmp0(webkit_web_view_get_uri(tab->view), uri) == 0) {
             start_page_show(tab); /* already there: refresh in place */
-        else
+            tab_fix_focus(tab);
+        } else
             webkit_web_view_load_uri(tab->view, uri); /* load-changed re-shows */
         g_free(uri);
         break;
@@ -1544,10 +1566,11 @@ static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, Win *win
     update_url_entry(win, tab);
     update_nav_buttons(win, tab);
     update_window_title(win, tab);
-    /* give the page the input focus so its text caret shows; keep the URL bar
+    /* give the tab's visible content the input focus so its text caret
+     * shows; tab_fix_focus keeps the URL bar (or any visible widget)
      * focused when it already is (e.g. cycling tabs while typing a URL) */
-    if (tab && !gtk_widget_has_focus(win->url_entry))
-        gtk_widget_grab_focus(GTK_WIDGET(tab->view));
+    if (tab)
+        tab_fix_focus(tab);
 }
 
 /* ---------- find in page (Ctrl+F) ---------- */
@@ -4393,18 +4416,24 @@ static void on_window_focus_in(GtkWidget *w, GdkEvent *e, Win *win)
     win->browser->active = win;
     /* When the toplevel regains X focus, GTK re-focuses its focus widget,
      * but for the NO_WINDOW WebKit view that re-focus doesn't always reach
-     * WebCore, so the text caret can stop blinking. If the window's focus is
-     * nominally on the view (or nowhere at all), force a focus round-trip so
-     * the view gets a fresh focus-in; leave it alone when another widget
-     * (e.g. the URL bar) holds the focus. */
+     * WebCore, so the text caret can stop blinking. Leave the focus alone
+     * when a visible non-view widget (URL bar, find bar, start page search
+     * box) holds it; otherwise force a focus round-trip to the widget this
+     * tab should have focused (the view, or the search box when the start
+     * page is shown) so it gets a fresh focus-in. */
     Tab *tab = current_tab(win);
     if (!tab)
         return;
     GtkWidget *fw = gtk_window_get_focus(GTK_WINDOW(win->window));
-    if (!fw || fw == GTK_WIDGET(tab->view)) {
-        gtk_window_set_focus(GTK_WINDOW(win->window), NULL);
-        gtk_window_set_focus(GTK_WINDOW(win->window), GTK_WIDGET(tab->view));
-    }
+    if (fw && fw != GTK_WIDGET(tab->view) && gtk_widget_is_visible(fw))
+        return;
+    GtkWidget *want = tab->on_start_page
+        ? find_named(tab->start_page, "start-search")
+        : GTK_WIDGET(tab->view);
+    if (!want)
+        return;
+    gtk_window_set_focus(GTK_WINDOW(win->window), NULL);
+    gtk_window_set_focus(GTK_WINDOW(win->window), want);
 }
 
 static void close_window(Win *win)
